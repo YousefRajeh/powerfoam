@@ -14,7 +14,7 @@ from powerfoam.scene import PowerfoamScene
 from powerfoam.viewer import Viewer
 
 
-def view(args, config_path):
+def view(args, config_path, feature_field_path=None):
     wp.init()
 
     checkpoint = config_path.replace("/config.yaml", "")
@@ -29,12 +29,21 @@ def view(args, config_path):
     model.initialize_from_dataset(data_handler, device="cuda")
     model.load_pt(f"{checkpoint}/model.pt")
     model.declare_optimizers(args, args.iterations)
-    model.sort_points()
+    if feature_field_path is None:
+        # sort_points() is safe here: nothing external depends on this
+        # process's primitive ordering.
+        model.sort_points()
+    # else: deliberately skip sort_points()/resample() -- a loaded feature
+    # field's primitive index p must match this exact, unresorted load_pt()
+    # order (see docs/feature-foam-phase2-viewer.md section 5).
     model.update_vis_cache()
     print(f"Loaded checkpoint: {checkpoint} ({model.points.shape[0]} points)")
 
     # Launch viewer (no training); uses rasterizer.
     viewer = Viewer(model, data_handler.cameras[0], world_up=data_handler.viewer_up)
+    if feature_field_path is not None:
+        viewer.load_feature_field(feature_field_path, model.points.device)
+        print(f"Loaded feature field: {feature_field_path}")
     viewer.run()
 
 
@@ -47,8 +56,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "-c", "--config", is_config_file=True, help="Path to config file"
     )
+    parser.add_argument(
+        "--feature_field",
+        default=None,
+        help="Path to a Feature Foam primitive feature field (.pt from feature-foam-solve) to enable the Feature PCA / Feature similarity viewer modes.",
+    )
 
     # Parse arguments
     args = parser.parse_args()
 
-    view(get_params(args), args.config)
+    view(get_params(args), args.config, args.feature_field)

@@ -750,11 +750,16 @@ class Rasterizer:
             tile_prim_indices: wp.array(dtype=wp.int32),
             tile_prim_indices_offsets: wp.array(dtype=wp.int64),
             options: VisOptions,
+            feature_sim: wp.array(dtype=wp.float32),
+            feature_pca: wp.array(dtype=wp.vec3f),
             color_out: wp.array2d(dtype=wp.vec3f),
             depth_out: wp.array2d(dtype=wp.float32),
             normal_out: wp.array2d(dtype=wp.vec3f),
             alpha_out: wp.array2d(dtype=wp.float32),
             intersections_out: wp.array2d(dtype=wp.int32),
+            feature_heat_out: wp.array2d(dtype=wp.float32),
+            feature_pca_out: wp.array2d(dtype=wp.vec3f),
+            front_prim_idx_out: wp.array2d(dtype=wp.int32),
         ):
             thread_idx = wp.tid()
             tile_idx = thread_idx // TILE_SIZE
@@ -782,10 +787,14 @@ class Rasterizer:
 
             rgb = wp.vec3f(0.0, 0.0, 0.0)
             normal_acc = wp.vec3f(0.0, 0.0, 0.0)
+            feature_heat_acc = float(0.0)
+            feature_pca_acc = wp.vec3f(0.0, 0.0, 0.0)
             depth_quantile_out = float(0.0)
             depth_quantile_found = wp.bool(False)
             log_t = float(0.0)
             n_intersections_hit = int(0)
+            front_prim_idx = int(-1)
+            front_weight = float(0.0)
 
             prim_offset_start = tile_prim_indices_offsets[tile_idx]
             prim_offset_end = tile_prim_indices_offsets[tile_idx + 1]
@@ -866,6 +875,11 @@ class Rasterizer:
 
                     rgb += color * alpha * trans
                     normal_acc += prim_normal * alpha * trans
+                    feature_heat_acc += feature_sim[prim_idx] * alpha * trans
+                    feature_pca_acc += feature_pca[prim_idx] * alpha * trans
+                    if alpha * trans > front_weight:
+                        front_weight = alpha * trans
+                        front_prim_idx = prim_idx
                     log_t += delta_log_t
 
                     if not depth_quantile_found:
@@ -886,8 +900,149 @@ class Rasterizer:
                 normal_out[pix_i, pix_j] = normal_acc
                 alpha_out[pix_i, pix_j] = ray_alpha
                 intersections_out[pix_i, pix_j] = n_intersections_hit
+                feature_heat_out[pix_i, pix_j] = feature_heat_acc
+                feature_pca_out[pix_i, pix_j] = feature_pca_acc
+                front_prim_idx_out[pix_i, pix_j] = front_prim_idx
 
         self.visualization_kernel = visualization_kernel
+
+        @wp.kernel(enable_backward=False)
+        def export_operator_kernel(
+            camera: WarpCamera,
+            all_spheres: wp.array(dtype=wp.vec4f),
+            all_nsigmas: wp.array(dtype=vec4s),
+            all_texel_sites: wp.array2d(dtype=vec3s),
+            all_texel_rgb: wp.array2d(dtype=vec3s),
+            all_texel_height: wp.array2d(dtype=scalar),
+            adjacency_offsets: wp.array(dtype=wp.int32),
+            adjacency_diff: wp.array(dtype=wp.vec4h),
+            tile_prim_indices: wp.array(dtype=wp.int32),
+            tile_prim_indices_offsets: wp.array(dtype=wp.int64),
+            transmittance_threshold: float,
+            max_intersections: wp.int32,
+            max_hits_per_pixel: wp.int32,
+            out_col: wp.array(dtype=wp.int32),
+            out_val: wp.array(dtype=wp.float32),
+            slot_counter: wp.array(dtype=wp.int32),
+            overflow_counter: wp.array(dtype=wp.int32),
+        ):
+            """Forward-only, no-grad twin of visualization_kernel: instead of
+            compositing RGB/depth/normal, records every (pixel, primitive,
+            alpha*trans) contribution into a fixed-capacity per-pixel sparse
+            buffer. Geometry/clipping calls are identical to visualization_kernel
+            and forward_kernel, so the exported weight is exactly what the real
+            renderer used for RGB at that pixel/primitive pair."""
+            thread_idx = wp.tid()
+            tile_idx = thread_idx // TILE_SIZE
+
+            tiles_h = 1 + (camera.height - 1) // TILE_WIDTH
+
+            tile_i = tile_idx % tiles_h
+            tile_j = tile_idx // tiles_h
+
+            idx_in_tile = thread_idx % TILE_SIZE
+            i_in_tile = idx_in_tile % TILE_WIDTH
+            j_in_tile = idx_in_tile // TILE_WIDTH
+
+            pix_i = tile_i * TILE_WIDTH + i_in_tile
+            pix_j = tile_j * TILE_WIDTH + j_in_tile
+
+            if pix_i >= camera.height or pix_j >= camera.width:
+                return
+
+            ray_d = get_ray_dir(camera, float(pix_i), float(pix_j))
+            ray_d = ray_d / wp.length(ray_d)
+            ray_o = camera.eye
+            row_idx = pix_i * camera.width + pix_j
+
+            log_t = float(0.0)
+
+            prim_offset_start = tile_prim_indices_offsets[tile_idx]
+            prim_offset_end = tile_prim_indices_offsets[tile_idx + 1]
+            total_prims = wp.int32(prim_offset_end - prim_offset_start)
+
+            for intersection_idx in range(total_prims):
+                if intersection_idx >= max_intersections:
+                    break
+
+                current_offset = prim_offset_start + wp.int64(intersection_idx)
+                prim_idx = tile_prim_indices[current_offset]
+
+                trans = wp.exp(log_t)
+                if trans < transmittance_threshold:
+                    break
+
+                sphere = all_spheres[prim_idx]
+                nsigma = all_nsigmas[prim_idx]
+                center = wp.vec3f(sphere[0], sphere[1], sphere[2])
+                radius = sphere[3]
+                prim_normal = wp.vec3f(
+                    float(nsigma[0]), float(nsigma[1]), float(nsigma[2])
+                )
+                sigma = float(nsigma[3])
+
+                hit, t_near, t_far = ray_sphere_intersect(ray_o, ray_d, center, radius)
+                if not hit:
+                    continue
+
+                adj_offset_start = adjacency_offsets[prim_idx]
+                adj_offset_end = adjacency_offsets[prim_idx + 1]
+                n_adj = adj_offset_end - adj_offset_start
+
+                for adj_idx in range(n_adj):
+                    current_adj_offset = adj_offset_start + adj_idx
+
+                    adj_diff = adjacency_diff[current_adj_offset]
+                    adj_center = center + wp.vec3f(
+                        float(adj_diff[0]), float(adj_diff[1]), float(adj_diff[2])
+                    )
+                    adj_radius = float(adj_diff[3])
+
+                    t_face, dp = ray_pface_intersect(
+                        ray_o, ray_d, center, radius, adj_center, adj_radius
+                    )
+
+                    t_far = wp.min(t_face, t_far) if dp >= 0.0 else t_far
+                    t_near = wp.max(t_face, t_near) if dp < 0.0 else t_near
+
+                    if t_near > t_far:
+                        break
+
+                if t_near > t_far:
+                    continue
+
+                _, _, height, _, t_surf, dp, color, _ = plane_intersection_fwd_local(
+                    ray_o,
+                    ray_d,
+                    t_near,
+                    center,
+                    prim_normal,
+                    radius,
+                    all_texel_sites[prim_idx],
+                    all_texel_rgb[prim_idx],
+                    all_texel_height[prim_idx],
+                    num_texel_sites,
+                )
+                t_far = wp.min(t_surf, t_far) if dp >= 0.0 else t_far
+                t_near = wp.max(t_surf, t_near) if dp < 0.0 else t_near
+
+                dt = t_far - t_near
+                if hit and dt > 0.0:
+                    delta_log_t = -sigma * dt
+                    alpha = 1.0 - wp.exp(delta_log_t)
+                    trans = wp.exp(log_t)
+                    weight = alpha * trans
+
+                    slot = wp.atomic_add(slot_counter, row_idx, 1)
+                    if slot < max_hits_per_pixel:
+                        out_col[row_idx * max_hits_per_pixel + slot] = prim_idx
+                        out_val[row_idx * max_hits_per_pixel + slot] = weight
+                    else:
+                        wp.atomic_add(overflow_counter, 0, 1)
+
+                    log_t += delta_log_t
+
+        self.export_operator_kernel = export_operator_kernel
 
         @wp.kernel(enable_backward=False)
         def forward_kernel(
@@ -2143,6 +2298,8 @@ class Rasterizer:
         adjacency,
         adjacency_offsets,
         vis_options=None,
+        feature_sim=None,
+        feature_pca=None,
     ):
         if vis_options is None:
             vis_options = VisOptions()
@@ -2171,6 +2328,11 @@ class Rasterizer:
                 [all_texel_rgb, all_texel_height[..., None]], dim=-1
             )
 
+            if feature_sim is None:
+                feature_sim = torch.zeros(num_points, dtype=torch.float32, device=self.device)
+            if feature_pca is None:
+                feature_pca = torch.zeros((num_points, 3), dtype=torch.float32, device=self.device)
+
             color_out = torch.zeros(
                 (camera.height, camera.width, 3),
                 dtype=torch.float32,
@@ -2193,6 +2355,22 @@ class Rasterizer:
             )
             intersections_out = torch.zeros(
                 (camera.height, camera.width),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            feature_heat_out = torch.zeros(
+                (camera.height, camera.width),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            feature_pca_out = torch.zeros(
+                (camera.height, camera.width, 3),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            front_prim_idx_out = torch.full(
+                (camera.height, camera.width),
+                -1,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -2273,13 +2451,165 @@ class Rasterizer:
                     tile_prim_indices,
                     offsets,
                     vis_options,
+                    feature_sim.detach(),
+                    feature_pca.detach(),
                     color_out,
                     depth_out,
                     normal_out,
                     alpha_out,
                     intersections_out,
+                    feature_heat_out,
+                    feature_pca_out,
+                    front_prim_idx_out,
                 ],
                 block_dim=TILE_SIZE,
             )
 
-            return color_out, depth_out, normal_out, alpha_out, intersections_out
+            return (
+                color_out,
+                depth_out,
+                normal_out,
+                alpha_out,
+                intersections_out,
+                feature_heat_out,
+                feature_pca_out,
+                front_prim_idx_out,
+            )
+
+    def export_operator(
+        self,
+        camera,
+        points,
+        radii,
+        density,
+        normals,
+        texel_sites,
+        texel_rgb,
+        texel_height,
+        adjacency,
+        adjacency_offsets,
+        transmittance_threshold=1e-3,
+        max_intersections=1024,
+        max_hits_per_pixel=64,
+    ):
+        """Forward-only sparse export of A[pixel, primitive] = alpha*trans for one
+        camera, reusing the exact same tile-candidate setup (count/write_visible,
+        prefetch_adjacency) as `visualize()`. Returns dense-packed per-pixel-slot
+        (col, val) buffers of shape (num_pixels * max_hits_per_pixel,), a
+        per-pixel slot-usage counter, and a scalar overflow counter (how many
+        hits were dropped because a pixel exceeded max_hits_per_pixel). Caller is
+        responsible for compacting to COO using slot_counter."""
+        with wp.ScopedDevice(str(self.device)):
+            torch_stream = torch.cuda.current_stream()
+            wp_stream = wp.stream_from_torch(torch_stream)
+            wp.set_stream(wp_stream)
+
+            num_points = points.shape[0]
+
+            tiles_h = 1 + (camera.height - 1) // TILE_WIDTH
+            tiles_w = 1 + (camera.width - 1) // TILE_WIDTH
+            total_tiles = tiles_h * tiles_w
+
+            all_spheres = torch.cat([points, radii[:, None]], dim=-1).to(torch.float32)
+            all_nsigmas = torch.cat([normals, density[:, None]], dim=-1).to(
+                self.tscalar
+            )
+            all_texel_sites = texel_sites.to(self.tscalar)
+            all_texel_rgb = texel_rgb.to(self.tscalar)
+            all_texel_height = texel_height.to(self.tscalar)
+
+            tile_inter_counts = torch.zeros(
+                total_tiles + 1, dtype=torch.int32, device=self.device
+            )
+
+            wp.launch(
+                self.count_visible_kernel,
+                dim=num_points,
+                inputs=[camera.to_warp(), all_spheres.detach(), tile_inter_counts],
+                block_dim=256,
+            )
+
+            offsets = torch.cumsum(tile_inter_counts.long(), dim=0)
+            n_intersections = offsets[-1].item()
+
+            tile_prim_indices = torch.zeros(
+                n_intersections, dtype=torch.int32, device=self.device
+            )
+            sort_keys = torch.zeros(
+                n_intersections, dtype=torch.int64, device=self.device
+            )
+            write_counter = torch.zeros(
+                total_tiles, dtype=torch.int32, device=self.device
+            )
+
+            wp.launch(
+                self.write_visible_kernel,
+                dim=num_points,
+                inputs=[
+                    camera.to_warp(),
+                    all_spheres.detach(),
+                    offsets,
+                    tile_prim_indices,
+                    sort_keys,
+                    write_counter,
+                ],
+                block_dim=256,
+            )
+
+            tile_prim_perm = torch.argsort(sort_keys)
+            tile_prim_indices = tile_prim_indices[tile_prim_perm]
+
+            adjacency_diff = torch.zeros(
+                adjacency.shape[0], 4, dtype=torch.float16, device=self.device
+            )
+
+            wp.launch(
+                self.prefetch_adjacency_kernel,
+                dim=num_points,
+                inputs=[
+                    all_spheres.detach(),
+                    adjacency,
+                    adjacency_offsets,
+                    adjacency_diff,
+                    num_points,
+                ],
+                block_dim=256,
+            )
+
+            num_pixels = camera.height * camera.width
+            out_col = torch.full(
+                (num_pixels * max_hits_per_pixel,), -1, dtype=torch.int32, device=self.device
+            )
+            out_val = torch.zeros(
+                num_pixels * max_hits_per_pixel, dtype=torch.float32, device=self.device
+            )
+            slot_counter = torch.zeros(num_pixels, dtype=torch.int32, device=self.device)
+            overflow_counter = torch.zeros(1, dtype=torch.int32, device=self.device)
+
+            raster_threads = total_tiles * TILE_SIZE
+            wp.launch(
+                self.export_operator_kernel,
+                dim=raster_threads,
+                inputs=[
+                    camera.to_warp(),
+                    all_spheres.detach(),
+                    all_nsigmas.detach(),
+                    all_texel_sites.detach(),
+                    all_texel_rgb.detach(),
+                    all_texel_height.detach(),
+                    adjacency_offsets,
+                    adjacency_diff,
+                    tile_prim_indices,
+                    offsets,
+                    transmittance_threshold,
+                    max_intersections,
+                    max_hits_per_pixel,
+                    out_col,
+                    out_val,
+                    slot_counter,
+                    overflow_counter,
+                ],
+                block_dim=TILE_SIZE,
+            )
+
+            return out_col, out_val, slot_counter, overflow_counter, num_pixels

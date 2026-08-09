@@ -390,7 +390,14 @@ class PowerfoamScene(nn.Module):
         with self._vis_cache_lock:
             self._vis_cache = cache
 
-    def forward_visualization(self, camera, vis_options=None, render_mode="rasterize"):
+    def forward_visualization(
+        self,
+        camera,
+        vis_options=None,
+        render_mode="rasterize",
+        feature_sim=None,
+        feature_pca=None,
+    ):
         """Forward pass for viewer visualization (no autograd).
 
         Uses cached view-independent attributes when available (populated by
@@ -471,6 +478,54 @@ class PowerfoamScene(nn.Module):
                 adjacency,
                 adjacency_offsets,
                 vis_options=vis_options,
+                feature_sim=feature_sim,
+                feature_pca=feature_pca,
+            )
+
+    def export_feature_operator(
+        self,
+        camera,
+        transmittance_threshold=1e-3,
+        max_intersections=1024,
+        max_hits_per_pixel=64,
+    ):
+        """Forward-only sparse export of per-(pixel, primitive) rendering weights
+        A[i, p] = alpha*trans for one camera (Feature Foam's operator half).
+
+        Called standalone (once per exported view, not per training/viewer
+        frame), so unlike ``forward_visualization`` this does not use or
+        populate the view-independent geometry cache. Texel color is not needed
+        by the exporter (only alpha/transmittance are), so a zero placeholder is
+        passed in place of the real spherical-Voronoi color to skip that compute.
+        """
+        with torch.no_grad():
+            normals = self.get_normals()
+            tangents, bitangent = self.get_tangents()
+            radii = self.get_radii()
+            offsets = self.texel_sites * radii[:, None, None]
+            offsets = (
+                offsets[..., 0:1] * tangents[:, None, :]
+                + offsets[..., 1:2] * bitangent[:, None, :]
+            )
+            texel_sites = self.points[:, None, :] + offsets
+            texel_height = self.texel_height * radii[:, None]
+            density = self.get_density()
+            texel_rgb = torch.zeros_like(texel_sites)
+
+            return self.rasterizer.export_operator(
+                camera,
+                self.points,
+                radii,
+                density,
+                normals,
+                texel_sites,
+                texel_rgb,
+                texel_height,
+                self.adjacency,
+                self.adjacency_offsets,
+                transmittance_threshold=transmittance_threshold,
+                max_intersections=max_intersections,
+                max_hits_per_pixel=max_hits_per_pixel,
             )
 
     def interpenetration(self):

@@ -12,7 +12,9 @@ from .camera import TorchCamera
 from .rasterize import VisOptions
 
 
-VIS_MODES = ["RGB", "Depth", "Normal", "Alpha", "Intersections"]
+VIS_MODES = ["RGB", "Depth", "Normal", "Alpha", "Intersections", "Feature PCA", "Feature similarity"]
+FEATURE_PCA_MODE = 5
+FEATURE_SIMILARITY_MODE = 6
 COLOR_MAPS = ["Gray", "Viridis", "Inferno", "Turbo"]
 RENDER_MODES = ["Rasterize"]
 RENDER_MODE_KEYS = ["rasterize"]
@@ -133,6 +135,8 @@ def compose_kernel(
     normal: wp.array2d(dtype=wp.vec3f),
     alpha: wp.array2d(dtype=wp.float32),
     intersections: wp.array2d(dtype=wp.int32),
+    feature_heat: wp.array2d(dtype=wp.float32),
+    feature_pca: wp.array2d(dtype=wp.vec3f),
     options: ComposeOptions,
     output: wp.array(dtype=wp.uint8),
 ):
@@ -174,6 +178,13 @@ def compose_kernel(
         max_int = float(wp.max(options.max_intersections, 1))
         i_norm = wp.clamp(float(intersections[i, j]) / max_int, 0.0, 1.0)
         rgb = apply_colormap_wp(i_norm, options.color_map)
+    elif options.vis_mode == 5:
+        # Feature PCA (per-primitive pseudocolor, alpha-weighted composite)
+        rgb = feature_pca[i, j]
+    elif options.vis_mode == 6:
+        # Feature similarity to the current query (cosine in [-1, 1] -> [0, 1])
+        s = wp.clamp((feature_heat[i, j] + 1.0) * 0.5, 0.0, 1.0)
+        rgb = apply_colormap_wp(s, options.color_map)
 
     r = wp.uint8(wp.clamp(rgb[0] * 255.0, 0.0, 255.0))
     g = wp.uint8(wp.clamp(rgb[1] * 255.0, 0.0, 255.0))
@@ -377,6 +388,8 @@ class GLDisplay:
         normal,
         alpha,
         intersections,
+        feature_heat,
+        feature_pca,
         compose_options,
     ):
         """Run the compose kernel, writing RGBA8 into the mapped PBO."""
@@ -397,6 +410,8 @@ class GLDisplay:
                     normal,
                     alpha,
                     intersections,
+                    feature_heat,
+                    feature_pca,
                     compose_options,
                     buf,
                 ],
@@ -494,12 +509,106 @@ class Viewer:
         self.max_intersections = 4096
 
         # Visualization settings
-        self.vis_mode = 0  # 0=RGB, 1=Depth, 2=Normal, 3=Alpha, 4=Intersections
+        self.vis_mode = 0  # 0=RGB, 1=Depth, 2=Normal, 3=Alpha, 4=Intersections, 5=Feature PCA, 6=Feature similarity
         self.color_map = 1  # 0=Gray, 1=Viridis, 2=Inferno, 3=Turbo
         self.checker_bg = False
         self.bg_color = [0.0, 0.0, 0.0]
         self.max_depth = 25.0
         self.depth_quantile = 0.5
+
+        # Feature Foam: per-primitive feature field (Phase 2) --------------------
+        self.feature_field = None  # (P, F) torch tensor, or None if not loaded
+        self.feature_valid_mask = None  # (P,) bool
+        self.pca_rgb = None  # (P, 3) precomputed once at load time
+        self.feature_sim = None  # (P,) cosine sim to the current query, recomputed on query change
+        self.query_feature = None  # (F,) current query vector
+        self.query_source = ""  # human-readable description of the current query
+        self.pending_click = None  # (px, py) captured this frame, consumed inside the lock
+        self.query_text_buf = ""
+        self.clip_model = None
+        self.clip_tokenizer = None
+
+    def load_feature_field(self, path, device):
+        """Load a Feature Foam primitive feature field (a `.pt` produced by
+        `feature-foam-solve`) and precompute its PCA pseudocolor. Must be called
+        with a model that was loaded WITHOUT a subsequent sort_points()/resample()
+        call -- see docs/feature-foam-phase2-viewer.md section 5 -- or the
+        primitive index here will not match the index the field was solved
+        against."""
+        field = torch.load(path, map_location=device, weights_only=True)
+        x = field["primitive_features"] if isinstance(field, dict) else field
+        valid = field.get("valid_mask") if isinstance(field, dict) else None
+        if valid is None:
+            valid = torch.ones(x.shape[0], dtype=torch.bool, device=device)
+        if x.shape[0] != self.model.points.shape[0]:
+            raise ValueError(
+                f"feature field has {x.shape[0]} primitives but the loaded model "
+                f"has {self.model.points.shape[0]} -- did sort_points()/resample() "
+                "run after load_pt() for this model, or was the field solved "
+                "against a different checkpoint load?"
+            )
+        self.feature_field = x.to(device=device, dtype=torch.float32)
+        self.feature_valid_mask = valid.to(device)
+        self.pca_rgb = self._compute_pca_rgb(self.feature_field, self.feature_valid_mask)
+        self.feature_sim = torch.zeros(x.shape[0], dtype=torch.float32, device=device)
+        self.query_source = ""
+
+    @staticmethod
+    def _compute_pca_rgb(x, valid_mask, low_pct=0.01, high_pct=0.99):
+        """PCA-to-RGB on unit-normalized features. Direction, not magnitude, is
+        what's meaningful here (it's what cosine similarity queries against);
+        some solvers (ridge) can produce wildly varying per-primitive magnitude
+        for weakly-identified primitives (observed range ~0 to ~32 vs.
+        weighted_average's tight [0.8, 1.0] on the garden checkpoint), which would
+        otherwise dominate a percentile-based color normalization and clip whole
+        spatial regions to solid black/white regardless of their actual
+        direction."""
+        rgb = torch.zeros(x.shape[0], 3, device=x.device, dtype=x.dtype)
+        x_valid = x[valid_mask]
+        if x_valid.shape[0] < 4:
+            return rgb
+        x_valid = x_valid / x_valid.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        mean = x_valid.mean(0, keepdim=True)
+        xc = x_valid - mean
+        _, _, v = torch.pca_lowrank(xc, q=3)
+        proj = xc @ v[:, :3]
+        lo = torch.quantile(proj, low_pct, dim=0)
+        hi = torch.quantile(proj, high_pct, dim=0)
+        proj = ((proj - lo) / (hi - lo).clamp_min(1e-6)).clamp(0, 1)
+        rgb[valid_mask] = proj
+        return rgb
+
+    def _recompute_similarity(self):
+        """Recompute per-primitive cosine similarity to self.query_feature. Cheap
+        (P, F) op done once per query change, not per frame."""
+        if self.feature_field is None or self.query_feature is None:
+            return
+        x_norm = self.feature_field / self.feature_field.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        q_norm = self.query_feature / self.query_feature.norm().clamp_min(1e-8)
+        sim = x_norm @ q_norm.to(x_norm.dtype)
+        sim[~self.feature_valid_mask] = -1.0
+        self.feature_sim = sim
+
+    def _ensure_clip_loaded(self, device):
+        if self.clip_model is not None:
+            return
+        import open_clip
+
+        self.clip_model, _, _ = open_clip.create_model_and_transforms(
+            "ViT-B-16-quickgelu", pretrained="openai"
+        )
+        self.clip_model = self.clip_model.eval().to(device)
+        self.clip_tokenizer = open_clip.get_tokenizer("ViT-B-16-quickgelu")
+
+    def set_text_query(self, text, device):
+        self._ensure_clip_loaded(device)
+        with torch.no_grad():
+            tokens = self.clip_tokenizer([text]).to(device)
+            feat = self.clip_model.encode_text(tokens).float()[0]
+        self.query_feature = feat
+        self.query_source = f'text: "{text}"'
+        self._recompute_similarity()
+        self.vis_mode = FEATURE_SIMILARITY_MODE
 
     def step(self, iteration):
         self.step_count = iteration
@@ -517,6 +626,14 @@ class Viewer:
 
         # Update Camera
         self.camera_controller.update(io)
+
+        # NOTE: a render-area click is captured at the END of this method (after
+        # the Controls window's widgets are declared), not here -- io.want_capture_mouse
+        # at this point still reflects the END of the PREVIOUS frame (no widgets
+        # have been declared yet this frame), so checking it this early let a
+        # click on e.g. the Mode combo leak through as a scene click underneath
+        # the panel. Captured clicks are stored in self.pending_click and consumed
+        # at the top of the NEXT frame's render, against that frame's front_prim_idx.
 
         current_time = time.time()
         composed = False
@@ -537,13 +654,28 @@ class Viewer:
 
                 cam = self.camera_controller.get_eval_camera(device)
 
-                color, depth, normal, alpha, intersections = (
+                color, depth, normal, alpha, intersections, feature_heat, feature_pca, front_prim_idx = (
                     self.model.forward_visualization(
                         cam,
                         vis_options=vis_options,
                         render_mode=RENDER_MODE_KEYS[self.render_mode],
+                        feature_sim=self.feature_sim,
+                        feature_pca=self.pca_rgb,
                     )
                 )
+
+                if self.pending_click is not None:
+                    px, py = self.pending_click
+                    self.pending_click = None
+                    if 0 <= py < front_prim_idx.shape[0] and 0 <= px < front_prim_idx.shape[1]:
+                        prim_idx = int(front_prim_idx[py, px].item())
+                        if prim_idx >= 0 and self.feature_field is not None:
+                            self.query_feature = self.feature_field[prim_idx].clone()
+                            self.query_source = f"primitive {prim_idx}"
+                            self._recompute_similarity()
+                            self.vis_mode = FEATURE_SIMILARITY_MODE
+                            # feature_heat above was rendered with the OLD query;
+                            # the new similarity-colored frame appears next tick.
 
                 # Build ComposeOptions
                 effective_max_depth = self.max_depth
@@ -568,6 +700,8 @@ class Viewer:
                     normal,
                     alpha,
                     intersections,
+                    feature_heat,
+                    feature_pca,
                     compose_opts,
                 )
 
@@ -694,8 +828,8 @@ class Viewer:
                     imgui.set_item_default_focus()
             imgui.end_combo()
 
-        # Color map (Depth / Intersections modes)
-        if self.vis_mode in (1, 4):
+        # Color map (Depth / Intersections / Feature similarity modes)
+        if self.vis_mode in (1, 4, FEATURE_SIMILARITY_MODE):
             if imgui.begin_combo("Color map", COLOR_MAPS[self.color_map]):
                 for i, name in enumerate(COLOR_MAPS):
                     selected = self.color_map == i
@@ -731,12 +865,55 @@ class Viewer:
                 "%.2f",
             )
 
+        # -- Feature Foam --------------------------------------------------------
+        if self.feature_field is not None:
+            imgui.separator_text("Feature Foam")
+            imgui.text(
+                f"Feature field: {self.feature_field.shape[0]} primitives, "
+                f"{self.feature_field.shape[1]}-d, "
+                f"{int(self.feature_valid_mask.sum())} valid"
+            )
+            imgui.text(f"Query: {self.query_source or '(none -- click the scene or search)'}")
+            _, self.query_text_buf = imgui.input_text("Text query", self.query_text_buf, 256)
+            imgui.same_line()
+            if imgui.button("Search") and self.query_text_buf.strip():
+                try:
+                    self.set_text_query(self.query_text_buf.strip(), self.model.points.device)
+                except Exception:
+                    import traceback
+
+                    traceback.print_exc()
+            imgui.text("Click anywhere on the render to query that primitive's feature.")
+
         # Help
         imgui.separator()
         imgui.text("WASD to move, Shift/Ctrl up/down")
         imgui.text("Drag to rotate, Space to pause")
 
+        # Snapshot this window's screen rect before end() so a click can be
+        # tested against it directly below -- io.want_capture_mouse turned out
+        # unreliable for this (a click that opens the Mode combo and selects an
+        # item in one motion, e.g. from an automated test, left want_capture_mouse
+        # false afterwards and leaked through as a scene-primitive query). An
+        # explicit rect containment check has no such timing dependency.
+        controls_min = imgui.get_window_pos()
+        controls_size = imgui.get_window_size()
+        controls_max = imgui.ImVec2(controls_min.x + controls_size.x, controls_min.y + controls_size.y)
+
         imgui.end()
+
+        # Capture a render-area click: only if it's outside every panel we drew
+        # this frame (currently just "Controls") and no widget claims the mouse.
+        click_in_controls = (
+            controls_min.x <= io.mouse_pos.x <= controls_max.x
+            and controls_min.y <= io.mouse_pos.y <= controls_max.y
+        )
+        if not io.want_capture_mouse and not click_in_controls and imgui.is_mouse_clicked(0):
+            disp_click = io.display_size
+            if disp_click.x > 0 and disp_click.y > 0:
+                px = int(io.mouse_pos.x / disp_click.x * self.camera_controller.width)
+                py = int(io.mouse_pos.y / disp_click.y * self.camera_controller.height)
+                self.pending_click = (px, py)
 
         # Update render resolution from window size
         disp = io.display_size
