@@ -11,3 +11,10 @@ __pycache__
 /output*
 /logs
 /artifacts
+
+# One-off run logs and build-diagnostic transcripts from the gsplat baseline
+# work (gsplat_baseline/*, and gsplat_*_build*.txt at the repo root) -- never
+# meant to be committed, just kept locally for debugging a given run.
+gsplat_baseline/*_log*.txt
+gsplat_build_log*.txt
+gsplat_gsview_build*.txt
