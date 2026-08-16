@@ -554,7 +554,7 @@ class Viewer:
         self.query_source = ""
 
     @staticmethod
-    def _compute_pca_rgb(x, valid_mask, low_pct=0.01, high_pct=0.99):
+    def _compute_pca_rgb(x, valid_mask, low_pct=0.01, high_pct=0.99, oversample_q=32):
         """PCA-to-RGB on unit-normalized features. Direction, not magnitude, is
         what's meaningful here (it's what cosine similarity queries against);
         some solvers (ridge) can produce wildly varying per-primitive magnitude
@@ -562,7 +562,15 @@ class Viewer:
         weighted_average's tight [0.8, 1.0] on the garden checkpoint), which would
         otherwise dominate a percentile-based color normalization and clip whole
         spatial regions to solid black/white regardless of their actual
-        direction."""
+        direction.
+
+        `torch.pca_lowrank` is a randomized SVD -- requesting exactly q=3 gives an
+        accurate top-3 subspace only when the data's true intrinsic rank is close
+        to 3. A scene with many more distinct object categories than that (more
+        real principal directions than 3) needs oversampling -- request a larger
+        `oversample_q` and slice the top 3 columns of V for display, rather than
+        computing rank-3 directly, so the displayed 3 axes are the genuine top-3
+        of a well-estimated larger subspace instead of an under-sampled artifact."""
         rgb = torch.zeros(x.shape[0], 3, device=x.device, dtype=x.dtype)
         x_valid = x[valid_mask]
         if x_valid.shape[0] < 4:
@@ -570,7 +578,8 @@ class Viewer:
         x_valid = x_valid / x_valid.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         mean = x_valid.mean(0, keepdim=True)
         xc = x_valid - mean
-        _, _, v = torch.pca_lowrank(xc, q=3)
+        q = min(oversample_q, x_valid.shape[0] - 1, x_valid.shape[1])
+        _, _, v = torch.pca_lowrank(xc, q=q)
         proj = xc @ v[:, :3]
         lo = torch.quantile(proj, low_pct, dim=0)
         hi = torch.quantile(proj, high_pct, dim=0)
