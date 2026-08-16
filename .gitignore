@@ -18,3 +18,19 @@ __pycache__
 gsplat_baseline/*_log*.txt
 gsplat_build_log*.txt
 gsplat_gsview_build*.txt
+
+# Same convention, extended to the room_0/LERF-OVS session's own one-off run
+# logs, build-diagnostic transcripts, and pip-install fragments -- kept
+# locally for debugging, never meant to be committed.
+*.log
+*_ascii.txt
+*_ascii[0-9].txt
+*_log.txt
+requirements_*.txt
+gsplat_baseline/*.log
+
+# marimo's own session cache -- regenerated locally, not project state.
+notebooks/__marimo__/
+
+# Large local model/checkpoint cache, not project source.
+/checkpoints
