@@ -26,15 +26,28 @@ def main():
     n_eff_hit, entropy_hit = n_eff[hit], entropy[hit]
     row_nnz = torch.bincount(a.row_indices, minlength=a.num_rows).float()
 
+    # torch.quantile's sort-based kernel has a hard input-size ceiling
+    # (~16.7M elements); room_0's test operator has ~32M valid rows, well
+    # past it. A random subsample is a legitimate, standard way to estimate
+    # quantiles at this scale -- the exact mean/median above are still
+    # computed on the full, unsampled data.
+    quantile_cap = 10_000_000
+    def sampled(x):
+        if x.numel() <= quantile_cap:
+            return x
+        idx = torch.randperm(x.numel(), device=x.device)[:quantile_cap]
+        return x[idx]
+    n_eff_q, entropy_q = sampled(n_eff_hit), sampled(entropy_hit)
+
     qs = [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
     report = {
         "operator": args.operator,
         "num_rows": a.num_rows, "num_primitives": a.num_primitives, "nnz": int(a.values.numel()),
         "hit_rows_fraction": float(hit.float().mean()),
         "n_eff_mean": float(n_eff_hit.mean()), "n_eff_median": float(n_eff_hit.median()),
-        "n_eff_quantiles": {str(q): float(torch.quantile(n_eff_hit, q)) for q in qs},
+        "n_eff_quantiles": {str(q): float(torch.quantile(n_eff_q, q)) for q in qs},
         "entropy_normalized_mean": float(entropy_hit.mean()), "entropy_normalized_median": float(entropy_hit.median()),
-        "entropy_normalized_quantiles": {str(q): float(torch.quantile(entropy_hit, q)) for q in qs},
+        "entropy_normalized_quantiles": {str(q): float(torch.quantile(entropy_q, q)) for q in qs},
         "near_one_hot_fraction_neff_lt_1_5": float((n_eff_hit < 1.5).float().mean()),
         "fraction_neff_lt_3": float((n_eff_hit < 3).float().mean()),
         "median_candidate_hits_per_pixel": float(row_nnz[hit].median()),

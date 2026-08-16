@@ -22,8 +22,10 @@ from feature_foam_lifting.operator import AccumulatedFeatureStats, normalize_fea
 
 CKPT_DIR = os.environ.get("GSPLAT_ARTIFACT_DIR", r"D:\Downloads\powerfoam\artifacts\garden_gsplat")
 CKPT_PATH = os.path.join(CKPT_DIR, "ckpt.pt")
-FEATURE_MANIFEST = r"D:\Downloads\powerfoam\artifacts\garden\openclip_train_all\feature_manifest.json"
-OUTPUT_PATH = os.path.join(CKPT_DIR, "train_stats_161views.pt")
+FEATURE_MANIFEST = os.environ.get(
+    "FEATURE_MANIFEST", r"D:\Downloads\powerfoam\artifacts\garden\openclip_train_all\feature_manifest.json"
+)
+OUTPUT_PATH = os.path.join(CKPT_DIR, os.environ.get("STATS_OUTPUT_NAME", "train_stats_161views.pt"))
 DEVICE = "cuda"
 
 
@@ -38,8 +40,21 @@ def main():
     camtoworlds = ckpt["camtoworlds"]
     viewmats_all = torch.linalg.inv(camtoworlds).to(DEVICE)
     train_idx = ckpt["train_idx"]
+    stride = int(os.environ.get("TRAIN_VIEW_STRIDE", "1"))
+    if stride > 1:
+        # CPU-side accumulate_view (needed at this primitive count to avoid
+        # OOM, see comment below) runs at roughly the same per-view cost
+        # regardless of scene -- garden's 161-view/3.64M-gaussian run took
+        # ~103 minutes. Room_0 has 787 train views; at a comparable per-view
+        # cost that's several hours, not tractable in one sitting. A stride
+        # keeps this a real multi-view accumulation (not a single view) at a
+        # practical view count -- noted explicitly wherever these numbers
+        # get reported, since it is a real asymmetry against PowerFoam's own
+        # accumulation (fast enough on GPU to use all 787 views).
+        train_idx = train_idx[::stride]
     num_primitives = means.shape[0]
-    print(f"[accumulate_gsplat_stats] {num_primitives} gaussians, {len(train_idx)} train views, {width}x{height}")
+    print(f"[accumulate_gsplat_stats] {num_primitives} gaussians, {len(train_idx)} train views "
+          f"(stride={stride}), {width}x{height}")
 
     manifest = json.loads(Path(FEATURE_MANIFEST).read_text())
     manifest_dir = Path(FEATURE_MANIFEST).parent
@@ -58,7 +73,10 @@ def main():
     # max id of 160, well after ~140 views had already been silently
     # misaligned).
     manifest_id_by_filename = {Path(v["image"]).name: v["id"] for v in manifest["views"]}
-    image_names = ckpt["image_names"]
+    # garden's checkpoint stores "image_names" (bare filenames); the Replica
+    # checkpoint stores "image_paths" (full paths) -- Path(...).name reduces
+    # either to a bare filename for matching, so either key works.
+    image_names = ckpt["image_names"] if "image_names" in ckpt else ckpt["image_paths"]
 
     def local_manifest_id(global_view_id):
         filename = Path(image_names[global_view_id]).name
