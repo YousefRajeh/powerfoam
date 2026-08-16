@@ -116,7 +116,7 @@ if __name__ == "__main__":
     parser = configargparse.ArgParser()
     get_params = add_group(parser, Params)
     parser.add_argument("-c", "--config", is_config_file=True, help="Path to config file")
-    parser.add_argument("--split", choices=("train", "test"), required=True)
+    parser.add_argument("--split", choices=("train", "test", "all"), required=True)
     parser.add_argument("--views", default="all", help='Comma-separated view indices, or "all"')
     parser.add_argument("--feature-manifest", required=True, help="OpenCLIP feature_manifest.json from feature-foam-extract-openclip")
     parser.add_argument("--output", required=False, default="")

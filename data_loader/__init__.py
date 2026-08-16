@@ -5,11 +5,13 @@ import torch
 
 from .colmap import COLMAPDataset
 from .blender import BlenderDataset
+from .replica import ReplicaDataset
 
 
 dataset_dict = {
     "colmap": COLMAPDataset,
     "blender": BlenderDataset,
+    "replica": ReplicaDataset,
 }
 
 
