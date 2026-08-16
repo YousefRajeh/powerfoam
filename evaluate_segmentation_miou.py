@@ -83,11 +83,62 @@ def hungarian_miou(pred_labels, gt_labels, num_clusters):
     return mean_iou, matches, matched_pixel_fraction
 
 
+def superpixel_pool_labels(rendered_labels, row_view_ids, data_dir, test_idx, height, width,
+                            n_segments=200, compactness=10.0):
+    """Tier 1 idea #4: majority-vote pool the rendered per-pixel cluster labels within each
+    frame's own SLIC superpixel regions (computed on the GT RGB image -- GT-independent,
+    just the photo, so this can't leak ground-truth labels into the prediction). A classic
+    segmentation post-processing step (SLIC superpixels + majority-vote pooling predates
+    CLIP-3D work entirely) that suppresses single-pixel label noise without touching the 3D
+    representation or solver at all. Unassigned (-1) pixels are left as -1 and excluded from
+    each superpixel's vote.
+
+    Room_0's real SAM masks aren't available for the held-out TEST views (extraction only
+    covers the 787 train views, by construction of the train/test split), so SLIC (computed
+    directly on the already-available GT RGB, no extra extraction needed) is the version of
+    this idea that's actually testable here without a new extraction pass -- see
+    ResearchVault/Ideas/general-mIoU-ideas.md Idea 8 for the SAM-mask variant this is a
+    zero-extra-cost stand-in for.
+    """
+    from skimage.segmentation import slic
+
+    pooled = rendered_labels.clone()
+    num_pixels_per_view = height * width
+    for view_idx, i in enumerate(test_idx.tolist()):
+        rgb_path = Path(data_dir) / "rgb" / f"rgb_{i}.png"
+        rgb = np.array(Image.open(rgb_path).convert("RGB"))
+        segments = slic(rgb, n_segments=n_segments, compactness=compactness, start_label=0)
+        segments = torch.from_numpy(segments.astype(np.int64)).reshape(-1)
+
+        start = view_idx * num_pixels_per_view
+        end = start + num_pixels_per_view
+        view_labels = pooled[start:end]
+
+        valid = view_labels >= 0
+        if not valid.any():
+            continue
+        num_segments_actual = int(segments.max()) + 1
+        for seg_id in range(num_segments_actual):
+            in_segment = (segments == seg_id) & valid
+            if not in_segment.any():
+                continue
+            votes = view_labels[in_segment]
+            majority = torch.bincount(votes).argmax()
+            view_labels[in_segment] = majority
+        pooled[start:end] = view_labels
+    return pooled
+
+
 def main():
     p = argparse.ArgumentParser(description="Evaluate rendered cluster segmentation against real Replica ground truth")
     p.add_argument("--segmentation", required=True, help="Output of feature_foam_lifting.segment_cli (with rendered_labels)")
     p.add_argument("--data-dir", default=r"D:\Downloads\powerfoam\data\replica\room_0")
     p.add_argument("--output", required=True)
+    p.add_argument("--superpixel-pool", action="store_true",
+                    help="Tier 1 idea #4: majority-vote pool predicted labels within SLIC "
+                    "superpixels (computed on GT RGB) before scoring -- see superpixel_pool_labels().")
+    p.add_argument("--slic-n-segments", type=int, default=200)
+    p.add_argument("--slic-compactness", type=float, default=10.0)
     args = p.parse_args()
 
     seg = torch.load(args.segmentation, map_location="cpu", weights_only=True)
@@ -107,11 +158,18 @@ def main():
         f"resolution or row-order mismatch"
     )
 
+    if args.superpixel_pool:
+        rendered_labels = superpixel_pool_labels(
+            rendered_labels, row_view_ids, args.data_dir, test_idx, height, width,
+            n_segments=args.slic_n_segments, compactness=args.slic_compactness,
+        )
+
     mean_iou, matches, matched_fraction = hungarian_miou(rendered_labels, gt_flat, num_clusters)
     matches.sort(key=lambda m: -m["iou"])
 
     report = {
         "segmentation_file": args.segmentation,
+        "superpixel_pool": args.superpixel_pool,
         "num_clusters": num_clusters,
         "num_test_views": len(test_idx),
         "resolution": [height, width],
