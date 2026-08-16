@@ -201,7 +201,7 @@ def accumulate_feature_stats_for_views(
         row_local = torch.arange(num_pixels, device=device).repeat_interleave(max_hits_per_pixel)[keep_mask]
         pix_y, pix_x = row_local // W, row_local % W
 
-        batch.append((cols, vals, fmap.to(device)[pix_y, pix_x]))
+        batch.append((cols, vals, fmap.to(device)[pix_y, pix_x], row_local))
 
         del out_col, out_val, fmap  # this view's triples/feature map are captured above; free the rest now
         if len(batch) >= batch_size:

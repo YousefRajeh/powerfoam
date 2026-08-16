@@ -19,7 +19,7 @@ eval: false
 # Model parameters
 init_type: "sfm"
 init_points: 100_000
-final_points: 500_000
+final_points: 1_200_000
 bkgd_color: [0.0, 0.0, 0.0]
 render_objective: "volume"
 sv_dof: 8
