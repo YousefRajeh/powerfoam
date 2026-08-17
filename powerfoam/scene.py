@@ -18,8 +18,29 @@ from .color_fn import SphericalVoronoi
 from .scheduling import get_cosine_scheduler
 
 
-def init_points_sfm(data_handler, num_points):
+def init_points_sfm(data_handler, num_points, outlier_filter_k=10.0):
     init_points = data_handler.points3D.float()
+
+    # Reject SfM points far outside the camera cluster before sampling. COLMAP
+    # occasionally triangulates spurious points tens-to-hundreds of units from
+    # the real scene (bad matches / repeated-texture depth ambiguity); left in,
+    # these get selected as init primitives (farthest-point sampling actively
+    # prefers far points) and never recover during training since no camera
+    # observes them clearly, showing up as stray "floater" cells outside the
+    # scene. Threshold is relative to camera spread (median, not max, so a
+    # single mis-registered camera pose doesn't inflate the tolerance) rather
+    # than a fixed distance, so it scales with each scene's own units.
+    camera_centers = torch.stack([cam.eye for cam in data_handler.cameras], dim=0).float()
+    cam_centroid = camera_centers.median(dim=0).values
+    cam_scale = (camera_centers - cam_centroid).norm(dim=-1).median()
+    dist_from_cams = (init_points - cam_centroid).norm(dim=-1)
+    keep_mask = dist_from_cams <= outlier_filter_k * cam_scale
+    n_dropped = int((~keep_mask).sum())
+    if n_dropped > 0:
+        print(f"Dropping {n_dropped}/{init_points.shape[0]} SfM points as spatial "
+              f"outliers (> {outlier_filter_k}x median camera distance from scene center)")
+        init_points = init_points[keep_mask]
+
     cpu_points = init_points.cpu().numpy()
 
     sample_points = min(num_points, int(0.95 * init_points.shape[0]))
