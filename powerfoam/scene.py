@@ -41,6 +41,16 @@ def init_points_sfm(data_handler, num_points, outlier_filter_k=10.0):
               f"outliers (> {outlier_filter_k}x median camera distance from scene center)")
         init_points = init_points[keep_mask]
 
+    if num_points >= init_points.shape[0]:
+        # Requesting exactly (or more than) all available points: use them all directly, no
+        # FPS subsampling or kNN-interpolated padding. Needed for a genuine "frozen point cloud"
+        # init (e.g. matching OpenGaussian's --frozen_init_pts on ScanNet, one primitive per GT
+        # point) -- without this, requesting num_points == init_points.shape[0] would still fall
+        # into the padding branch below (since that only checks num_points < 0.9x, not equality)
+        # and silently replace ~5% of the real points with synthetic kNN-interpolated ones,
+        # which is never what "give me exactly these points" should mean.
+        return init_points
+
     cpu_points = init_points.cpu().numpy()
 
     sample_points = min(num_points, int(0.95 * init_points.shape[0]))
