@@ -251,6 +251,21 @@ def main(args):
                 print(f"WARNING: classes not present in this scene's GT, skipped: {missing}")
         target_names = [class_id_to_name[str(i)] for i in target_ids]
 
+    # OpenGaussian's own convention (eval_scannet.py): average mIoU/mAcc only over classes
+    # actually PRESENT in this scene's GT, not just present in the overall vocabulary. Missing
+    # this caused a real bug caught by inspection: scene0062_00 (a bathroom) has zero
+    # chair/sofa/table/window/cabinet points at all, so those classes trivially scored IoU=0.0
+    # (no possible true positives), dragging the "mean" down over classes that were never a fair
+    # test to begin with. Filter here, uniformly for both GT formats.
+    present_ids = set(np.unique(raw_labels).tolist())
+    absent_in_scene = [n for i, n in zip(target_ids, target_names) if i not in present_ids]
+    if absent_in_scene:
+        print(f"NOTE: classes in target vocabulary but absent from this scene's GT (excluded "
+              f"from the per-scene mean, per OpenGaussian's own convention): {absent_in_scene}")
+    kept = [(i, n) for i, n in zip(target_ids, target_names) if i in present_ids]
+    target_ids = [i for i, _ in kept]
+    target_names = [n for _, n in kept]
+
     print(f"Evaluating over {len(target_ids)} classes: {list(zip(target_ids, target_names))}")
 
     gt_labels_remapped = remap_gt_labels(raw_labels, target_ids)
@@ -278,6 +293,13 @@ def main(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--gt-points", default=r"D:\Downloads\powerfoam\artifacts\replica_room0\gt_point_cloud_3d.npz")
+    p.add_argument("--gt-format", choices=["npz", "scannet"], default="npz",
+                    help="'npz' (default): room_0/LERF-OVS back-projected GT (unproject_*_gt.py "
+                    "output). 'scannet': Pointcept's per-scene .npy GT -- --gt-points must then be "
+                    "the scene's directory (containing coord.npy/segment20.npy/etc.), not a file.")
+    p.add_argument("--scannet-label-field", default="segment20",
+                    help="Which Pointcept label file to use when --gt-format scannet: 'segment20' "
+                    "(official 20-class ScanNet benchmark labels, default) or 'segment200'.")
     p.add_argument("--method", choices=["powerfoam", "splat_feature_solver", "both"], default="both")
     p.add_argument("--classes", default="coarse",
                     help="'coarse' (default, see COARSE_CLASS_NAMES), 'all' (every class present "
