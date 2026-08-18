@@ -419,7 +419,8 @@ def propagate_leftovers(labels, adjacent, offsets, unit_feats, valid_mask_t, num
 
 
 def eval_scene(scene, split, threshold, device, class_sets, text_cache, mode="capped",
-               normal_tau=0.8, plane_tau=0.9, coplanar_eps=0.05, min_plane_size=500):
+               normal_tau=0.8, plane_tau=0.9, coplanar_eps=0.05, min_plane_size=500,
+               restrict_owners=False, point_weight=False, consolidate_min=200):
     ckpt_dir = f"output/scannet_{scene}_nonfrozen"
     features_path = f"artifacts/scannet/{scene}/solved_geometric_median_nonfrozen.pt"
     adjacency_path = f"artifacts/scannet/{scene}/adjacency_nonfrozen.pt"
@@ -444,7 +445,62 @@ def eval_scene(scene, split, threshold, device, class_sets, text_cache, mode="ca
     vm_t = torch.from_numpy(valid_mask).to(device)
     unit_all[vm_t] = F.normalize(feats[vm_t], dim=-1)
 
-    if mode == "batched":
+    # Assignment BEFORE clustering: per-cell GT-point ownership counts drive the
+    # owner-restriction/point-weighting options. ~90% of valid cells own zero GT points
+    # (measured: 87.4% scene0000_00, 90.8% scene0645_00) -- the metric never reads their
+    # predictions, and OpenGaussian's frozen 1:1 protocol has no such cells at all.
+    assigned = assign_points_to_power_cells(gt_points, centers, radii, valid=valid_mask, k=64)
+    owned_counts_np = np.bincount(assigned[assigned >= 0], minlength=centers.shape[0])
+    owned_counts = torch.from_numpy(owned_counts_np).to(device).float()
+    if restrict_owners:
+        vm_t = vm_t & (owned_counts > 0)
+        n_owners = int(vm_t.sum())
+        print(f"  [{scene}] owner restriction: clustering over {n_owners} point-owning cells", flush=True)
+    pool_weights = owned_counts.clamp_min(1.0) if point_weight else None
+
+    if mode == "batched_consolidated":
+        # pool-size test: exhaustive growth, then merge every region smaller than
+        # consolidate_min into its feature-nearest large region (region-centroid level,
+        # NOT per-primitive flooding) -- recovers big pools + full coverage
+        labels, num_regions = batched_region_grow(adjacent, offsets, unit_all, vm_t, threshold)
+        sizes = torch.bincount(labels[labels >= 0], minlength=num_regions)
+        cents = torch.zeros(num_regions, unit_all.shape[1], device=device)
+        li = labels >= 0
+        cents.index_add_(0, labels[li], unit_all[li])
+        cents = F.normalize(cents, dim=-1)
+        if consolidate_min < 0:
+            # top-K mode (-K): keep the K largest regions, merge everything else into
+            # them -- pool granularity adapts to scene size exactly like k-means' k=320
+            topk = min(-consolidate_min, int((sizes > 0).sum()))
+            cut = sizes[torch.argsort(sizes, descending=True)[topk - 1]].clamp_min(2)
+            big = torch.where(sizes >= cut)[0]
+            small = torch.where((sizes > 0) & (sizes < cut))[0]
+        else:
+            big = torch.where(sizes >= consolidate_min)[0]
+            small = torch.where((sizes > 0) & (sizes < consolidate_min))[0]
+        if big.numel() > 0 and small.numel() > 0:
+            tgt = big[(cents[small] @ cents[big].T).argmax(dim=1)]
+            remap = torch.arange(num_regions, device=device)
+            remap[small] = tgt
+            labels[li] = remap[labels[li]]
+        kept = torch.unique(labels[li])
+        compact = torch.full((num_regions,), -1, dtype=torch.long, device=device)
+        compact[kept] = torch.arange(kept.numel(), device=device)
+        labels[li] = compact[labels[li]]
+        n_before = num_regions
+        num_regions = int(kept.numel())
+        print(f"  [{scene} thr={threshold} batched_consolidated min={consolidate_min}] "
+              f"regions {n_before} -> {num_regions}, valid={int(vm_t.sum())}", flush=True)
+    elif mode == "kmeans_pos":
+        from run_cluster_classify_eval import two_level_position_aware, K_FLAT
+        vi = torch.where(vm_t)[0]
+        pos_v = torch.from_numpy(centers[vi.cpu().numpy()]).to(device).float()
+        leaf = two_level_position_aware(pos_v, unit_all[vi], seed=0)
+        labels = torch.full((unit_all.shape[0],), -1, dtype=torch.long, device=device)
+        labels[vi] = leaf
+        num_regions = K_FLAT
+        print(f"  [{scene} kmeans_pos] 64x5 over {int(vm_t.sum())} cells", flush=True)
+    elif mode == "batched":
         labels, num_regions = batched_region_grow(adjacent, offsets, unit_all, vm_t, threshold)
         nonsingleton = int((torch.bincount(labels[labels >= 0], minlength=num_regions) > 1).sum())
         print(f"  [{scene} thr={threshold} batched] regions={num_regions} "
@@ -514,7 +570,6 @@ def eval_scene(scene, split, threshold, device, class_sets, text_cache, mode="ca
         print(f"  [{scene} thr={threshold}] regions={num_regions}, grown={grown}, "
               f"propagated={int((labels >= 0).sum()) - grown}, valid={int(vm_t.sum())}", flush=True)
 
-    assigned = assign_points_to_power_cells(gt_points, centers, radii, valid=valid_mask, k=64)
     owned = assigned >= 0
 
     name_to_id = {n: i for i, n in enumerate(all_names)}
@@ -532,7 +587,8 @@ def eval_scene(scene, split, threshold, device, class_sets, text_cache, mode="ca
         text_feats = text_cache[key]
 
         prim_cls_valid = pool_classify_broadcast(
-            labels[valid_idx], unit_all[valid_idx], num_regions, text_feats).cpu().numpy()
+            labels[valid_idx], unit_all[valid_idx], num_regions, text_feats,
+            weights=pool_weights[valid_idx] if pool_weights is not None else None).cpu().numpy()
         prim_class = np.zeros(centers.shape[0], dtype=np.int64)
         prim_class[valid_idx.cpu().numpy()] = prim_cls_valid
         pred = np.zeros(gt_points.shape[0], dtype=np.int64)
@@ -548,11 +604,14 @@ def main():
     p.add_argument("--scenes", default="all", help="'all' or comma-separated scene names")
     p.add_argument("--thresholds", default="0.85", help="comma-separated cosine thresholds")
     p.add_argument("--class-sets", default="all", help="'all' or comma-separated class set names")
+    p.add_argument("--consolidate-min", type=int, default=200)
+    p.add_argument("--restrict-owners", action="store_true")
+    p.add_argument("--point-weight", action="store_true")
     p.add_argument("--normal-tau", type=float, default=0.8)
     p.add_argument("--plane-tau", type=float, default=0.9)
     p.add_argument("--coplanar-eps", type=float, default=0.05)
     p.add_argument("--min-plane-size", type=int, default=500)
-    p.add_argument("--mode", choices=["capped", "exhaustive", "exhaustive_mean", "batched", "batched_normal", "plane_first", "plane_ransac"], default="capped")
+    p.add_argument("--mode", choices=["capped", "exhaustive", "exhaustive_mean", "batched", "batched_normal", "plane_first", "plane_ransac", "kmeans_pos", "batched_consolidated"], default="capped")
     p.add_argument("--output", default=None)
     args = p.parse_args()
 
@@ -568,7 +627,9 @@ def main():
         for scene, split in scenes.items():
             per_cs = eval_scene(scene, split, thr, device, class_sets, text_cache, mode=args.mode,
                                 normal_tau=args.normal_tau, plane_tau=args.plane_tau,
-                                coplanar_eps=args.coplanar_eps, min_plane_size=args.min_plane_size)
+                                coplanar_eps=args.coplanar_eps, min_plane_size=args.min_plane_size,
+                                restrict_owners=args.restrict_owners, point_weight=args.point_weight,
+                                consolidate_min=args.consolidate_min)
             for cs, m in per_cs.items():
                 results[cs][scene] = m
         summary[str(thr)] = {}

@@ -80,9 +80,11 @@ def two_level_position_aware(positions, unit_feats, seed=0):
     return leaf_global
 
 
-def pool_classify_broadcast(labels, unit_feats, num_labels, text_feats):
+def pool_classify_broadcast(labels, unit_feats, num_labels, text_feats, weights=None):
+    """weights: optional (N,) per-primitive pooling weight (e.g. #GT points owned) --
+    aligns the pooled mean with what the point-level metric actually reads."""
     pooled = torch.zeros(num_labels, unit_feats.shape[1], device=unit_feats.device)
-    pooled.index_add_(0, labels, unit_feats)
+    pooled.index_add_(0, labels, unit_feats * weights[:, None] if weights is not None else unit_feats)
     norms = pooled.norm(dim=-1, keepdim=True)
     nonempty = norms.squeeze(-1) > 1e-8
     pooled = pooled / norms.clamp_min(1e-8)
