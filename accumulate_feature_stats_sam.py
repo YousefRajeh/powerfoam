@@ -56,12 +56,14 @@ def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, h
     features = torch.from_numpy(np.load(feature_path)).to("cuda").float()
     segment = torch.from_numpy(np.load(segment_path)).to("cuda").to(torch.long) + 1
     if sam_level is not None:
+        if isinstance(sam_level, str):
+            sam_level = [int(x) for x in sam_level.split(",")]
         # Use ONLY this SAM granularity level (LangSplat hierarchy in _s.npy: 0=default,
         # 1=subpart(s), 2=part(m), 3=whole(l)). OpenGaussian's README: "we only use the
         # large-level mask"; NormLift (per its author) likewise uses the l-level. Summing
         # all 4 levels per pixel (the splat-distiller loader default) blends up to 4 mask
         # embeddings per pixel -- the measured feature-contamination source.
-        segment = segment[sam_level:sam_level + 1]
+        segment = segment[sam_level] if isinstance(sam_level, list) else segment[sam_level:sam_level + 1]
     zero_row = torch.zeros(1, 512, device=features.device, dtype=features.dtype)
     features_pad = torch.cat([zero_row, features], dim=0)
     feat_map = F.embedding(segment, features_pad).sum(dim=0)
@@ -144,7 +146,7 @@ if __name__ == "__main__":
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--images-subdir", default="images")
     p.add_argument("--feature-name-format", default=None)
-    p.add_argument("--sam-level", type=int, default=None,
+    p.add_argument("--sam-level", type=str, default=None,
                    help="use only this SAM granularity level (3 = whole/l-level, the "
                         "OpenGaussian/NormLift convention); default sums all levels")
     cli_args = p.parse_args()

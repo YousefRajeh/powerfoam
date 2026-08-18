@@ -53,10 +53,26 @@ def load_foam(checkpoint_dir, device, return_normals=False):
     return model.points.detach().cpu().numpy(), model.get_radii().detach().cpu().numpy()
 
 
-def spherical_kmeans(x, k, iters=25, seed=0):
+def fps_features(x, k, seed=0):
+    """Greedy farthest-point sampling in cosine distance on unit features: seeds spread
+    across feature modes instead of following density (user-proposed init)."""
+    g = torch.Generator(device=x.device).manual_seed(seed)
+    idx = torch.empty(k, dtype=torch.long, device=x.device)
+    idx[0] = torch.randint(0, x.shape[0], (1,), generator=g, device=x.device)
+    min_sim = x @ x[idx[0]]
+    for i in range(1, k):
+        idx[i] = min_sim.argmin()
+        min_sim = torch.maximum(min_sim, x @ x[idx[i]])
+    return idx
+
+
+def spherical_kmeans(x, k, iters=25, seed=0, init="randperm"):
     """x: (N, C) unit-normalized. Returns (labels, centroids)."""
     g = torch.Generator(device=x.device).manual_seed(seed)
-    centroids = x[torch.randperm(x.shape[0], generator=g, device=x.device)[:k]].clone()
+    if init == "fps":
+        centroids = x[fps_features(x, k, seed=seed)].clone()
+    else:
+        centroids = x[torch.randperm(x.shape[0], generator=g, device=x.device)[:k]].clone()
     for _ in range(iters):
         sim = x @ centroids.T
         labels = sim.argmax(dim=1)

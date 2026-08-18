@@ -420,9 +420,9 @@ def propagate_leftovers(labels, adjacent, offsets, unit_feats, valid_mask_t, num
 
 def eval_scene(scene, split, threshold, device, class_sets, text_cache, mode="capped",
                normal_tau=0.8, plane_tau=0.9, coplanar_eps=0.05, min_plane_size=500,
-               restrict_owners=False, point_weight=False, consolidate_min=200):
+               restrict_owners=False, point_weight=False, consolidate_min=200, suffix=""):
     ckpt_dir = f"output/scannet_{scene}_nonfrozen"
-    features_path = f"artifacts/scannet/{scene}/solved_geometric_median_nonfrozen.pt"
+    features_path = f"artifacts/scannet/{scene}/solved_geometric_median_nonfrozen{suffix}.pt"
     adjacency_path = f"artifacts/scannet/{scene}/adjacency_nonfrozen.pt"
     gt_dir = rf"D:\Downloads\scannet_pointcept\{split}\{scene}"
 
@@ -605,6 +605,7 @@ def main():
     p.add_argument("--thresholds", default="0.85", help="comma-separated cosine thresholds")
     p.add_argument("--class-sets", default="all", help="'all' or comma-separated class set names")
     p.add_argument("--consolidate-min", type=int, default=200)
+    p.add_argument("--suffix", default="", help="feature-set suffix, e.g. _l3")
     p.add_argument("--restrict-owners", action="store_true")
     p.add_argument("--point-weight", action="store_true")
     p.add_argument("--normal-tau", type=float, default=0.8)
@@ -629,7 +630,7 @@ def main():
                                 normal_tau=args.normal_tau, plane_tau=args.plane_tau,
                                 coplanar_eps=args.coplanar_eps, min_plane_size=args.min_plane_size,
                                 restrict_owners=args.restrict_owners, point_weight=args.point_weight,
-                                consolidate_min=args.consolidate_min)
+                                consolidate_min=args.consolidate_min, suffix=args.suffix)
             for cs, m in per_cs.items():
                 results[cs][scene] = m
         summary[str(thr)] = {}

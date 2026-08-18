@@ -63,7 +63,7 @@ def euclidean_kmeans(x, k, iters=25, seed=0):
     return torch.cdist(x, centroids).argmin(dim=1)
 
 
-def two_level_position_aware(positions, unit_feats, seed=0):
+def two_level_position_aware(positions, unit_feats, seed=0, leaf_init="randperm"):
     """64 position roots x up-to-5 feature leaves -> global leaf label per primitive."""
     root = euclidean_kmeans(positions, NUM_ROOTS, seed=seed)
     leaf_global = torch.zeros_like(root)
@@ -75,7 +75,7 @@ def two_level_position_aware(positions, unit_feats, seed=0):
         if k == 1:
             leaf = torch.zeros(idx.numel(), dtype=torch.long, device=root.device)
         else:
-            leaf, _ = spherical_kmeans(unit_feats[idx], k, seed=seed + r)
+            leaf, _ = spherical_kmeans(unit_feats[idx], k, seed=seed + r, init=leaf_init)
         leaf_global[idx] = r * LEAVES_PER_ROOT + leaf
     return leaf_global
 
