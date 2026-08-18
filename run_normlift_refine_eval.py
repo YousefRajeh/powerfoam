@@ -92,7 +92,9 @@ def mode_vote_refine(unit, R, positions, adjacent, offsets, sigma_d=None,
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--scenes", default="scene0000_00")
-    p.add_argument("--variant", default="nonfrozen", help="nonfrozen | truefrozen | frozen_v2")
+    p.add_argument("--variant", default="nonfrozen", help="nonfrozen | truefrozen | frozen")
+    p.add_argument("--suffix", default="", help="feature-set suffix, e.g. '_l3'")
+    p.add_argument("--gt-root", default=r"D:\Downloads\scannet_pointcept")
     p.add_argument("--class-sets", default="all")
     p.add_argument("--tau", type=float, default=0.8)
     p.add_argument("--gamma", type=float, default=0.05)
@@ -107,12 +109,12 @@ def main():
     for scene in args.scenes.split(","):
         split = SCENES[scene]
         ckpt_dir = f"output/scannet_{scene}_{args.variant}"
-        stats_path = f"artifacts/scannet/{scene}/train_stats_sam_{args.variant}.pt"
+        stats_path = f"artifacts/scannet/{scene}/train_stats_sam_{args.variant}{args.suffix}.pt"
         adjacency_path = f"artifacts/scannet/{scene}/adjacency_{args.variant}.pt"
-        gt_dir = rf"D:\Downloads\scannet_pointcept\{split}\{scene}"
+        gt_dir = f"{args.gt_root}/{split}/{scene}"
 
         stats = AccumulatedFeatureStats.load(stats_path)
-        solved = torch.load(f"artifacts/scannet/{scene}/solved_geometric_median_{args.variant}.pt",
+        solved = torch.load(f"artifacts/scannet/{scene}/solved_geometric_median_{args.variant}{args.suffix}.pt",
                             map_location=device, weights_only=True)
         feats = solved["primitive_features"].to(device).float()
         valid_mask = solved["valid_mask"].cpu().numpy()
