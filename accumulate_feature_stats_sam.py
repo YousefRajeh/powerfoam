@@ -30,9 +30,20 @@ from powerfoam.feature_operator import accumulate_feature_stats_for_views
 from feature_foam_lifting.operator import AccumulatedFeatureStats  # noqa: F401 (import path sanity)
 
 
-def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str) -> torch.Tensor:
+def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, height: int = 480, width: int = 640) -> torch.Tensor:
     """Copied verbatim from gsplat_ext/datasets/normalize.py (with the float() fix already
-    applied there this session for the fp16-on-disk issue)."""
+    applied there this session for the fp16-on-disk issue), EXCEPT the missing-feature
+    placeholder shape, which is now parameterized by the actual camera resolution rather than
+    hardcoded to Replica's fixed 480x640. Real bug found on ScanNet retraining (commit after
+    324775e): scene0062_00's frame 0 has no extracted SAM+CLIP feature (a handful of frames are
+    intentionally skipped by the extractor when every SAM mask is degenerate), so this fallback
+    fires -- but ScanNet cameras are NOT 480x640, so the placeholder's shape silently mismatched
+    the real per-view pixel count, and downstream `lazy_b`'s `row_local // W, row_local % W`
+    indexing (built from the REAL camera H*W) read out of bounds of the WRONG-shaped placeholder,
+    triggering a CUDA device-side assert deep in a later kernel (confirmed via
+    CUDA_LAUNCH_BLOCKING=1 -- the assert fires exactly at this indexing line, not spuriously
+    elsewhere). Passing height/width through so the placeholder always matches the view it's
+    standing in for fixes this for any dataset, not just Replica's fixed resolution."""
     feature_path = feature_folder / f"{image_stem}_f.npy"
     segment_path = feature_folder / f"{image_stem}_s.npy"
     if not feature_path.exists():
@@ -40,9 +51,8 @@ def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str) -
         # every SAM mask degenerate and were intentionally skipped by the extractor. Shape
         # must match a real feat_map (H, W, C), not normalize.py's (1,1,512) placeholder --
         # this loader's caller (accumulate_feature_stats_for_views) needs a real per-pixel map.
-        # room_0 SAM features are all rendered at a fixed 480x640 resolution.
-        print(f"[accumulate_feature_stats_sam] WARNING: no SAMOpenCLIP feature for {image_stem} -- using zero feature map (480x640x512)")
-        return torch.zeros(480, 640, 512, device="cuda")
+        print(f"[accumulate_feature_stats_sam] WARNING: no SAMOpenCLIP feature for {image_stem} -- using zero feature map ({height}x{width}x512)")
+        return torch.zeros(height, width, 512, device="cuda")
     features = torch.from_numpy(np.load(feature_path)).to("cuda").float()
     segment = torch.from_numpy(np.load(segment_path)).to("cuda").to(torch.long) + 1
     zero_row = torch.zeros(1, 512, device=features.device, dtype=features.dtype)
@@ -101,7 +111,8 @@ def main(scene: str, config_path: str, feature_folder: str, output_path: str, ba
     feature_dir = Path(feature_folder)
 
     def load_feature_map(view_id):
-        return load_image_feature_from_SAMOpenCLIP(feature_dir, image_names[view_id])
+        camera = cameras[view_id]
+        return load_image_feature_from_SAMOpenCLIP(feature_dir, image_names[view_id], height=camera.height, width=camera.width)
 
     print(f"[accumulate_feature_stats_sam] scene={scene} views={len(indices)} num_primitives={model.points.shape[0]} batch_size={batch_size}")
     torch.cuda.synchronize()
