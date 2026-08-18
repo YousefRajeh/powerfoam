@@ -9,6 +9,15 @@
 # (though PowerFoam doesn't NEED this for evaluation -- point_cloud_query.py's power-cell
 # membership works on any checkpoint -- this run exists to directly test whether freezing
 # vs. not freezing affects reconstruction/rendering quality and the downstream point-mIoU).
+#
+# IMPORTANT: points_lr_init/final are ALSO 0.0 below (not just densify disabled). Verified
+# directly against OpenGaussian's own scene/gaussian_model.py: `if training_args.frozen_init_pts:
+# self._xyz = self._xyz.detach()` -- their "frozen" means positions are completely detached from
+# the gradient (never move at all via backprop either), not just "never split/cloned/pruned".
+# An earlier version of this config only disabled densify_from/until and left points_lr active
+# (1e-3 -> 5e-5), so primitives still drifted via gradient descent every iteration -- a real,
+# caught discrepancy from OpenGaussian's actual convention, not an intentional design choice.
+# All 10 ScanNet scenes' "frozen" checkpoints trained before this fix need to be redone.
 
 # Experiment parameters
 iterations: 30_000
@@ -38,8 +47,8 @@ sv_dof: 8
 num_texel_sites: 8
 
 # Optimization parameters
-points_lr_init: 1e-3
-points_lr_final: 5e-5
+points_lr_init: 0.0
+points_lr_final: 0.0
 density_lr_init: 1e0
 density_lr_final: 1e0
 radii_lr_init: 5e-5
