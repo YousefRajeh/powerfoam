@@ -117,7 +117,7 @@ def weighted_geomedian(vectors, weights, iters=25):
     return x
 
 
-def solve_scene(scene, split, device, min_iou, min_pixel_weight, feature_dir_root):
+def solve_scene(scene, split, device, min_iou, min_pixel_weight, feature_dir_root, cluster_mode="kmeans_pos"):
     features_path = f"artifacts/scannet/{scene}/solved_geometric_median_nonfrozen.pt"
     solved = torch.load(features_path, map_location=device, weights_only=True)
     feats = solved["primitive_features"].to(device).float()
@@ -131,13 +131,25 @@ def solve_scene(scene, split, device, min_iou, min_pixel_weight, feature_dir_roo
     radii = model.get_radii().detach().cpu().numpy()
     positions = torch.from_numpy(centers[vi.cpu().numpy()]).to(device).float()
 
-    leaf = two_level_position_aware(positions, unit, seed=0)
-    prim_cluster = torch.full((centers.shape[0],), -1, dtype=torch.long, device=device)
-    prim_cluster[vi] = leaf
+    if cluster_mode == "grower":
+        from run_region_grow_eval import batched_region_grow
+        adj = torch.load(f"artifacts/scannet/{scene}/adjacency_nonfrozen.pt",
+                         map_location=device, weights_only=True)
+        adjacent, offsets = adj["adjacent"].to(device).long(), adj["offsets"].to(device).long()
+        unit_all_p = torch.zeros(centers.shape[0], unit.shape[1], device=device)
+        unit_all_p[vi] = unit
+        prim_cluster, num_clusters = batched_region_grow(adjacent, offsets, unit_all_p, vm_t, 0.95)
+        leaf_full = prim_cluster[vi]
+    else:
+        leaf = two_level_position_aware(positions, unit, seed=0)
+        prim_cluster = torch.full((centers.shape[0],), -1, dtype=torch.long, device=device)
+        prim_cluster[vi] = leaf
+        leaf_full = leaf
+        num_clusters = K_FLAT
 
     # pixel-pooled fallback features (current protocol's pools)
-    pooled = torch.zeros(K_FLAT, unit.shape[1], device=device)
-    pooled.index_add_(0, leaf, unit)
+    pooled = torch.zeros(num_clusters, unit.shape[1], device=device)
+    pooled.index_add_(0, leaf_full, unit)
     pooled = F.normalize(pooled, dim=-1)
 
     feature_dir = Path(feature_dir_root) / scene / "openclip_features_sam"
@@ -154,7 +166,7 @@ def solve_scene(scene, split, device, min_iou, min_pixel_weight, feature_dir_roo
             camera, transmittance_threshold=1e-3, max_intersections=1024,
             max_hits_per_pixel=MAX_HITS)
         dom = per_pixel_dominant_cluster(out_col, out_val, slot_counter, prim_cluster,
-                                         num_pixels, K_FLAT, min_pixel_weight, device)
+                                         num_pixels, num_clusters, min_pixel_weight, device)
         del out_col, out_val, slot_counter
 
         seg = torch.from_numpy(np.load(spath)).to(device).long()  # (L, H, W), -1 = none
@@ -164,8 +176,8 @@ def solve_scene(scene, split, device, min_iou, min_pixel_weight, feature_dir_roo
             seg = seg.unsqueeze(0)
         seg = seg.reshape(seg.shape[0], -1)  # (L, num_pixels)
 
-        cluster_size = torch.bincount(dom[dom >= 0], minlength=K_FLAT).float()
-        inter = torch.zeros(K_FLAT * M, device=device)
+        cluster_size = torch.bincount(dom[dom >= 0], minlength=num_clusters).float()
+        inter = torch.zeros(num_clusters * M, device=device)
         mask_size = torch.zeros(M, device=device)
         for l in range(seg.shape[0]):
             sl = seg[l]
@@ -175,7 +187,7 @@ def solve_scene(scene, split, device, min_iou, min_pixel_weight, feature_dir_roo
             if both.any():
                 k = dom[both] * M + sl[both]
                 inter.index_add_(0, k, torch.ones(int(both.sum()), device=device))
-        inter = inter.reshape(K_FLAT, M)
+        inter = inter.reshape(num_clusters, M)
         union = cluster_size[:, None] + mask_size[None, :] - inter
         iou = inter / union.clamp_min(1.0)
         best_iou, best_m = iou.max(dim=1)
@@ -192,7 +204,7 @@ def solve_scene(scene, split, device, min_iou, min_pixel_weight, feature_dir_roo
         picked_cl = torch.cat(picked_cl)
         picked_feat = torch.cat(picked_feat)
         picked_w = torch.cat(picked_w)
-    matched = torch.zeros(K_FLAT, dtype=torch.bool, device=device)
+    matched = torch.zeros(num_clusters, dtype=torch.bool, device=device)
     cluster_feats = pooled.clone()
     if len(picked_cl) > 0:
         for c in torch.unique(picked_cl).tolist():
@@ -200,7 +212,7 @@ def solve_scene(scene, split, device, min_iou, min_pixel_weight, feature_dir_roo
             cluster_feats[c] = weighted_geomedian(picked_feat[m], picked_w[m])
             matched[c] = True
     print(f"  [{scene}] views used={n_views_used}, mask-matched clusters="
-          f"{int(matched.sum())}/{K_FLAT} (fallback=pixel-pooled for the rest), "
+          f"{int(matched.sum())}/{num_clusters} (fallback=pixel-pooled for the rest), "
           f"selections={len(picked_cl)}", flush=True)
     return cluster_feats, prim_cluster, centers, radii, valid_mask
 
@@ -209,6 +221,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--scenes", default="all")
     p.add_argument("--class-sets", default="all")
+    p.add_argument("--cluster-mode", choices=["kmeans_pos", "grower"], default="kmeans_pos")
     p.add_argument("--min-iou", type=float, default=0.25)
     p.add_argument("--min-pixel-weight", type=float, default=0.3)
     p.add_argument("--feature-root", default="artifacts/scannet")
@@ -222,7 +235,8 @@ def main():
     results = {cs: {} for cs in class_sets}
     for scene, split in scenes.items():
         cluster_feats, prim_cluster, centers, radii, valid_mask = solve_scene(
-            scene, split, device, args.min_iou, args.min_pixel_weight, args.feature_root)
+            scene, split, device, args.min_iou, args.min_pixel_weight, args.feature_root,
+            cluster_mode=args.cluster_mode)
 
         gt_dir = rf"D:\Downloads\scannet_pointcept\{split}\{scene}"
         gt_points, raw_labels, all_names = load_scannet_pointcept_gt(gt_dir, "segment20")
