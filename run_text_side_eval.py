@@ -86,6 +86,15 @@ def embed_prompts(class_names, prompt_mode, device):
 
 
 def classify(pooled_unit, text_feats, calibration):
+    if calibration == "abt1":
+        # all-but-the-top (Mu & Viswanath 2018), k=1: remove the dominant common
+        # direction of the POOLED FEATURES (class-agnostic, no text/class info --
+        # feature-side postprocessing, not a scoring-rule change), then plain argmax.
+        mu = pooled_unit.mean(0, keepdim=True)
+        X = pooled_unit - mu
+        _, _, V = torch.linalg.svd(X, full_matrices=False)
+        pooled_unit = F.normalize(X - (X @ V[:1].T) @ V[:1], dim=-1)
+        calibration = "none"
     sim = pooled_unit @ text_feats.T  # (R, K)
     if calibration == "none":
         pass

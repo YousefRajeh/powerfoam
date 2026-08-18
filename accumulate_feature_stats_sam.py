@@ -30,7 +30,7 @@ from powerfoam.feature_operator import accumulate_feature_stats_for_views
 from feature_foam_lifting.operator import AccumulatedFeatureStats  # noqa: F401 (import path sanity)
 
 
-def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, height: int = 480, width: int = 640) -> torch.Tensor:
+def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, height: int = 480, width: int = 640, sam_level=None) -> torch.Tensor:
     """Copied verbatim from gsplat_ext/datasets/normalize.py (with the float() fix already
     applied there this session for the fp16-on-disk issue), EXCEPT the missing-feature
     placeholder shape, which is now parameterized by the actual camera resolution rather than
@@ -55,6 +55,13 @@ def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, h
         return torch.zeros(height, width, 512, device="cuda")
     features = torch.from_numpy(np.load(feature_path)).to("cuda").float()
     segment = torch.from_numpy(np.load(segment_path)).to("cuda").to(torch.long) + 1
+    if sam_level is not None:
+        # Use ONLY this SAM granularity level (LangSplat hierarchy in _s.npy: 0=default,
+        # 1=subpart(s), 2=part(m), 3=whole(l)). OpenGaussian's README: "we only use the
+        # large-level mask"; NormLift (per its author) likewise uses the l-level. Summing
+        # all 4 levels per pixel (the splat-distiller loader default) blends up to 4 mask
+        # embeddings per pixel -- the measured feature-contamination source.
+        segment = segment[sam_level:sam_level + 1]
     zero_row = torch.zeros(1, 512, device=features.device, dtype=features.dtype)
     features_pad = torch.cat([zero_row, features], dim=0)
     feat_map = F.embedding(segment, features_pad).sum(dim=0)
@@ -63,7 +70,7 @@ def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, h
 
 
 def main(scene: str, config_path: str, feature_folder: str, output_path: str, batch_size: int = 1,
-         images_subdir: str = "images", feature_name_format: str = None):
+         images_subdir: str = "images", feature_name_format: str = None, sam_level=None):
     wp.init()
     parser = configargparse.ArgParser()
     add_group(parser, Params)
@@ -112,7 +119,7 @@ def main(scene: str, config_path: str, feature_folder: str, output_path: str, ba
 
     def load_feature_map(view_id):
         camera = cameras[view_id]
-        return load_image_feature_from_SAMOpenCLIP(feature_dir, image_names[view_id], height=camera.height, width=camera.width)
+        return load_image_feature_from_SAMOpenCLIP(feature_dir, image_names[view_id], height=camera.height, width=camera.width, sam_level=sam_level)
 
     print(f"[accumulate_feature_stats_sam] scene={scene} views={len(indices)} num_primitives={model.points.shape[0]} batch_size={batch_size}")
     torch.cuda.synchronize()
@@ -137,6 +144,9 @@ if __name__ == "__main__":
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--images-subdir", default="images")
     p.add_argument("--feature-name-format", default=None)
+    p.add_argument("--sam-level", type=int, default=None,
+                   help="use only this SAM granularity level (3 = whole/l-level, the "
+                        "OpenGaussian/NormLift convention); default sums all levels")
     cli_args = p.parse_args()
     main(cli_args.scene, cli_args.config, cli_args.feature_folder, cli_args.output, cli_args.batch_size,
-         images_subdir=cli_args.images_subdir, feature_name_format=cli_args.feature_name_format)
+         images_subdir=cli_args.images_subdir, feature_name_format=cli_args.feature_name_format, sam_level=cli_args.sam_level)
