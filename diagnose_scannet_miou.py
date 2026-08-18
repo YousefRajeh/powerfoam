@@ -30,7 +30,7 @@ from evaluate_point_cloud_miou import (
 from point_cloud_query import assign_points_to_power_cells
 
 
-def load_foam(checkpoint_dir, device):
+def load_foam(checkpoint_dir, device, return_normals=False):
     import warp as wp
     import configargparse
     from configs import Params, add_group
@@ -47,6 +47,9 @@ def load_foam(checkpoint_dir, device):
     model = PowerfoamScene(args)
     model.initialize_from_dataset(data_handler, device=device)
     model.load_pt(f"{checkpoint_dir}/model.pt")
+    if return_normals:
+        return (model.points.detach().cpu().numpy(), model.get_radii().detach().cpu().numpy(),
+                model.get_normals().detach().cpu().numpy())
     return model.points.detach().cpu().numpy(), model.get_radii().detach().cpu().numpy()
 
 
