@@ -135,22 +135,38 @@ def accumulate_feature_stats_for_views(
     list before this function runs defeats the entire point (161 views x
     648x420x512 float32 is ~90GB; one at a time is ~550MB).
 
-    `batch_size` views' exported triples are queued up (each view's own,
-    never-concatenated (nnz, channels) gather) and folded in via one
-    `accumulate_views` call per batch. CORRECTED after benchmarking on the real
-    garden checkpoint (161 views, 1.2M primitives, 512-d): batching this way is
-    NOT a free throughput win. Every queued-but-not-yet-reduced view's `b`
-    gather (several GB each at F=512) stays alive in the `batch` list until the
-    whole batch flushes, so peak memory genuinely scales with `batch_size` --
-    batch_size=16 OOMs a 48GB GPU where batch_size=8 does not. And the measured
-    wall-clock was flat across batch_size in {1, 4, 8} (~0.25-0.48 s/view all
-    three, with the batch_size=1 number likely inflated by one-time Warp kernel
-    compilation rather than genuine per-call overhead) -- per-view rendering and
-    disk I/O dominate, not Python dispatch, so there is little to gain from
-    batching here regardless. Keep `batch_size` small (1-4); it exists mainly so
-    a caller CAN trade a bounded amount of extra memory for fewer Python calls
-    if their profiling shows dispatch overhead actually matters for their
-    workload, not because it does here.
+    Each view's feature gather is passed to `accumulate_view` as a LAZY callable
+    `(start, end) -> (end-start, F)` closed over that view's own feature map,
+    rather than the materialized `fmap[pix_y, pix_x]` tensor this function used
+    to build eagerly. Diagnosed root cause of a real OOM at high-resolution
+    views with many primitives (e.g. ScanNet's 1296x968 images,
+    >~500k-670k primitives): building that full `(nnz, F)` gather up front
+    happened BEFORE `accumulate_view`'s own internal `_nnz_chunks` chunking ever
+    got a chance to help (that chunking only applies to a `b` that's already
+    fully materialized -- it can't un-materialize an already-OOMing gather).
+    Passing a lazy callable instead lets `accumulate_view` gather each
+    bounded-size chunk on demand, inside its own loop, so peak memory per view
+    is independent of that view's resolution/nnz. This is an exact fix, not a
+    heuristic: it's the same streaming reduction as before, just with the
+    gather deferred to the point it's actually consumed (see
+    AccumulatedFeatureStats.accumulate_view's docstring and
+    feature-foam-lifting/tests/test_operator.py::
+    test_accumulate_view_lazy_gather_matches_materialized_b for the proof that
+    this produces bit-identical accumulator state, including the
+    view-order-sensitive geometric-median/reliability fields, to gathering `b`
+    fully up front).
+
+    `batch_size` views' exported triples are queued up (each view's own lazy
+    gather closure, never a materialized (nnz, channels) tensor) and folded in
+    via one `accumulate_views` call per batch. CORRECTED after benchmarking on
+    the real garden checkpoint (161 views, 1.2M primitives, 512-d): batching
+    this way is NOT a free throughput win, and the measured wall-clock was flat
+    across batch_size in {1, 4, 8} (~0.25-0.48 s/view) -- per-view rendering and
+    disk I/O dominate, not Python dispatch. Now that queued entries are lazy
+    closures rather than materialized gathers, batch_size no longer trades
+    memory for fewer Python calls the way it used to (each view's gather is
+    still bounded-size regardless of when it runs) -- it's kept only because
+    there's no reason to remove it, not because it matters for memory anymore.
 
     (Full ridge_pcg is NOT reproducible from these stats -- it needs the coupled
     A^T A, not just its diagonal support2 -- so it stays batch/view-limited via
@@ -164,7 +180,7 @@ def accumulate_feature_stats_for_views(
     device = model.points.device
     stats = None
     total_dropped = 0
-    batch = []  # list of (cols, vals, b) tuples, one per view -- never concatenated
+    batch = []  # list of (cols, vals, lazy_b, row_local, feature_dim) tuples, one per view
 
     def flush_batch():
         nonlocal batch
@@ -199,11 +215,17 @@ def accumulate_feature_stats_for_views(
         cols = out_col[keep_mask].long()
         vals = out_val[keep_mask]
         row_local = torch.arange(num_pixels, device=device).repeat_interleave(max_hits_per_pixel)[keep_mask]
-        pix_y, pix_x = row_local // W, row_local % W
 
-        batch.append((cols, vals, fmap.to(device)[pix_y, pix_x], row_local))
+        feature_dim = fmap.shape[-1]
+        fmap_dev = fmap.to(device)
 
-        del out_col, out_val, fmap  # this view's triples/feature map are captured above; free the rest now
+        def lazy_b(start, end, fmap_dev=fmap_dev, row_local=row_local, W=W):
+            chunk_row_local = row_local[start:end]
+            return fmap_dev[chunk_row_local // W, chunk_row_local % W]
+
+        batch.append((cols, vals, lazy_b, row_local, feature_dim))
+
+        del out_col, out_val, fmap  # fmap_dev is captured by lazy_b's closure; freed once this view's batch entry flushes
         if len(batch) >= batch_size:
             flush_batch()
 
