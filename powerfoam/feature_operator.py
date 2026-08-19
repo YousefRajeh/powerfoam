@@ -112,6 +112,7 @@ def accumulate_feature_stats_for_views(
     max_intersections=1024,
     max_hits_per_pixel=64,
     batch_size=4,
+    weight_transform=None,
 ):
     """Stream-accumulate per-primitive sufficient statistics (support, support2,
     numerator, sq_numerator -- see AccumulatedFeatureStats) across ANY number of
@@ -212,8 +213,25 @@ def accumulate_feature_stats_for_views(
         slot_arange = torch.arange(max_hits_per_pixel, device=device)
         keep_mask = (slot_arange[None, :] < slots_used[:, None]).reshape(-1)
 
+        # weight_transform: reshape lifting weights to test the sharpness hypothesis vs
+        # splat-style alpha-blending (which concentrates on dominant surface splats,
+        # unlike the volumetric operator's up-to-64 cells per ray):
+        #   'top1' -- each pixel's feature goes ONLY to its max-weight cell (hard
+        #             surface assignment, the sharpest splat analogue)
+        #   'sq'   -- w^2 (soft sharpening; renormalization is irrelevant because the
+        #             weighted solve normalizes per-primitive anyway)
+        if weight_transform == "top1":
+            vmat = out_val.reshape(num_pixels, max_hits_per_pixel)
+            top = vmat.argmax(dim=1)
+            hard = torch.zeros_like(vmat)
+            ar = torch.arange(num_pixels, device=device)
+            hard[ar, top] = vmat[ar, top]
+            out_val = hard.reshape(-1)
+        elif weight_transform == "sq":
+            out_val = out_val * out_val
+
         cols = out_col[keep_mask].long()
-        vals = out_val[keep_mask]
+        vals = out_val.reshape(-1)[keep_mask]
         row_local = torch.arange(num_pixels, device=device).repeat_interleave(max_hits_per_pixel)[keep_mask]
 
         feature_dim = fmap.shape[-1]

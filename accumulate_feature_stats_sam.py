@@ -72,7 +72,8 @@ def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, h
 
 
 def main(scene: str, config_path: str, feature_folder: str, output_path: str, batch_size: int = 1,
-         images_subdir: str = "images", feature_name_format: str = None, sam_level=None):
+         images_subdir: str = "images", feature_name_format: str = None, sam_level=None,
+         weight_transform=None):
     wp.init()
     parser = configargparse.ArgParser()
     add_group(parser, Params)
@@ -126,7 +127,8 @@ def main(scene: str, config_path: str, feature_folder: str, output_path: str, ba
     print(f"[accumulate_feature_stats_sam] scene={scene} views={len(indices)} num_primitives={model.points.shape[0]} batch_size={batch_size}")
     torch.cuda.synchronize()
     t0 = time.time()
-    stats = accumulate_feature_stats_for_views(model, cameras, indices, load_feature_map, batch_size=batch_size)
+    stats = accumulate_feature_stats_for_views(model, cameras, indices, load_feature_map, batch_size=batch_size,
+                                               weight_transform=weight_transform)
     torch.cuda.synchronize()
     elapsed = time.time() - t0
     print(f"[accumulate_feature_stats_sam] TIMING batch_size={batch_size} num_views={len(indices)} elapsed_sec={elapsed:.3f} sec_per_view={elapsed / max(len(indices), 1):.4f}")
@@ -146,9 +148,12 @@ if __name__ == "__main__":
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--images-subdir", default="images")
     p.add_argument("--feature-name-format", default=None)
+    p.add_argument("--weight-transform", choices=["top1", "sq"], default=None,
+                   help="lifting-weight reshaping: top1 = per-pixel hard assignment to "
+                        "the dominant cell (splat-style), sq = w^2 soft sharpening")
     p.add_argument("--sam-level", type=str, default=None,
                    help="use only this SAM granularity level (3 = whole/l-level, the "
                         "OpenGaussian/NormLift convention); default sums all levels")
     cli_args = p.parse_args()
     main(cli_args.scene, cli_args.config, cli_args.feature_folder, cli_args.output, cli_args.batch_size,
-         images_subdir=cli_args.images_subdir, feature_name_format=cli_args.feature_name_format, sam_level=cli_args.sam_level)
+         images_subdir=cli_args.images_subdir, feature_name_format=cli_args.feature_name_format, sam_level=cli_args.sam_level, weight_transform=cli_args.weight_transform)
