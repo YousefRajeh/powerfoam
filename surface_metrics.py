@@ -95,15 +95,26 @@ if __name__ == "__main__":
     from pathlib import Path
     p = argparse.ArgumentParser()
     p.add_argument("--mesh", required=True)
-    p.add_argument("--gt", required=True, help="path to coord.npy")
+    p.add_argument("--gt", default=None, help="path to coord.npy (sparse vertices)")
+    p.add_argument("--gt-mesh", default=None,
+                   help="path to the ScanNet points3d.ply MESH. Strongly preferred over --gt: "
+                        "the mesh is densely sampled so GT fills its own surface voxels. With "
+                        "sparse vertices (~3cm spacing) voxel IoU measures GT sparsity, not "
+                        "reconstruction error -- measured on scene0000_00, GT occupies 80k "
+                        "voxels at 2cm as vertices vs 434k when sampled from the mesh.")
+    p.add_argument("--gt-sample", type=int, default=2_000_000)
     p.add_argument("--tag", default=None)
     p.add_argument("--n-sample", type=int, default=2_000_000)
-    p.add_argument("--voxels", default="0.02,0.05")
+    p.add_argument("--voxels", default="0.02,0.05,0.10")
     p.add_argument("--output", default=None)
     a = p.parse_args()
     mesh = o3d.io.read_triangle_mesh(a.mesh)
     rec = np.asarray(mesh.sample_points_uniformly(number_of_points=a.n_sample).points)
-    gt = np.load(a.gt).astype(np.float64)
+    if a.gt_mesh:
+        gtm = o3d.io.read_triangle_mesh(a.gt_mesh)
+        gt = np.asarray(gtm.sample_points_uniformly(a.gt_sample).points).astype(np.float64)
+    else:
+        gt = np.load(a.gt).astype(np.float64)
     m = full_surface_metrics(rec, gt, voxels=[float(x) for x in a.voxels.split(",")])
     print_metrics(a.tag or Path(a.mesh).stem, m)
     if a.output:
