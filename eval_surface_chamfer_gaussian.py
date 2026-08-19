@@ -31,6 +31,59 @@ from eval_surface_chamfer import chamfer
 from run_cluster_classify_eval import SCENES
 
 
+def render_median_depth(means, quats, scales, opacities, colors, sh_degree,
+                        viewmat, K, W, H, n_slices=48, near=0.1, far=6.0):
+    """Median depth (2DGS convention) for gsplat, which exposes no median mode.
+
+    Exact definition: the depth at which accumulated transmittance first falls below 0.5,
+    i.e. the smallest t with A(t) >= 0.5 where A is accumulated alpha. gsplat composites
+    Gaussians sorted by camera-space center depth, so restricting the render to Gaussians
+    with center depth < t yields precisely A(t). Sweeping t over `n_slices` thresholds
+    therefore samples the true A(t) curve, and since A is monotone the per-pixel crossing
+    is recovered by linear interpolation between the bracketing slices -- second-order
+    accurate, no CUDA kernel required (2DGS ships one; GOF avoids the issue with a level
+    set).
+
+    Returns (median_depth HxW, valid HxW in {0,1}). A pixel has a well-defined median depth
+    exactly when its accumulated alpha reaches 0.5 somewhere in the sweep, so `valid` is that
+    crossing indicator -- NOT the alpha of the last slice evaluated, which would drop
+    legitimately-crossed pixels (an earlier version did that and completeness collapsed to
+    19cm).
+    """
+    device = means.device
+    zc = (means @ viewmat[0, :3, :3].T + viewmat[0, :3, 3])[:, 2]      # camera-space z
+    ts = torch.linspace(near, far, n_slices, device=device)
+    ones = torch.ones((means.shape[0], 1), device=device)
+
+    A_prev = torch.zeros((H, W), device=device)
+    t_prev = torch.full((H, W), near, device=device)
+    med = torch.zeros((H, W), device=device)
+    done = torch.zeros((H, W), dtype=torch.bool, device=device)
+    A_last = torch.zeros((H, W), device=device)
+
+    for t in ts:
+        m = zc < t
+        if not bool(m.any()):
+            continue
+        _, ra, _ = rasterization(
+            means=means[m], quats=quats[m], scales=torch.exp(scales[m]),
+            opacities=torch.sigmoid(opacities[m]), colors=ones[m],
+            viewmats=viewmat, Ks=K[None], width=W, height=H,
+            sh_degree=None, render_mode="RGB", packed=False)
+        A = ra[0, ..., 0]
+        cross = (~done) & (A >= 0.5)
+        if bool(cross.any()):
+            # linear interpolation of the 0.5 crossing between the bracketing slices
+            denom = (A - A_prev).clamp_min(1e-8)
+            frac = ((0.5 - A_prev) / denom).clamp(0.0, 1.0)
+            med = torch.where(cross, t_prev + frac * (t - t_prev), med)
+            done = done | cross
+        A_prev, t_prev, A_last = A, torch.full_like(t_prev, float(t)), A
+        if bool(done.all()):
+            break
+    return med, done.float()
+
+
 def load_splats(ckpt_path, device):
     """splat-distiller .pt ({'splats': {...}}) or a graphdeco-style .ply."""
     if str(ckpt_path).endswith(".ply"):
@@ -59,6 +112,10 @@ def main():
     p.add_argument("--n-sample", type=int, default=1_000_000)
     p.add_argument("--thresh", type=float, default=0.05)
     p.add_argument("--max-views", type=int, default=None)
+    p.add_argument("--depth-mode", choices=["expected", "median"], default="median",
+                   help="median = 2DGS convention (transmittance crossing 0.5), computed by "
+                        "alpha sweep since gsplat has no median mode; expected = gsplat RGB+ED")
+    p.add_argument("--n-slices", type=int, default=48)
     p.add_argument("--out-mesh", default=None)
     p.add_argument("--output", default=None)
     args = p.parse_args()
@@ -86,13 +143,18 @@ def main():
         K = d["K"].to(device).float()
         H, W = int(d["image"].shape[0]), int(d["image"].shape[1])
         viewmat = torch.linalg.inv(c2w)[None]           # world -> camera
-        rc, ra, _ = rasterization(
-            means=means, quats=quats, scales=torch.exp(scales),
-            opacities=torch.sigmoid(opacities), colors=colors,
-            viewmats=viewmat, Ks=K[None], width=W, height=H,
-            sh_degree=sh_degree, render_mode="RGB+ED", packed=False)
-        depth = rc[0, ..., -1]                           # expected depth, camera-space z
-        alpha = ra[0, ..., 0]
+        if args.depth_mode == "median":
+            depth, alpha = render_median_depth(
+                means, quats, scales, opacities, colors, sh_degree,
+                viewmat, K, W, H, n_slices=args.n_slices, far=args.depth_trunc)
+        else:
+            rc, ra, _ = rasterization(
+                means=means, quats=quats, scales=torch.exp(scales),
+                opacities=torch.sigmoid(opacities), colors=colors,
+                viewmats=viewmat, Ks=K[None], width=W, height=H,
+                sh_degree=sh_degree, render_mode="RGB+ED", packed=False)
+            depth = rc[0, ..., -1]                       # expected depth, camera-space z
+            alpha = ra[0, ..., 0]
         dep = torch.where(alpha >= args.min_alpha, depth, torch.zeros_like(depth))
         dep_np = dep.detach().cpu().numpy().astype(np.float32)
         if not np.isfinite(dep_np).any() or (dep_np > 0).sum() < 100:
@@ -110,7 +172,7 @@ def main():
         if n_used % 25 == 0:
             print(f"  fused {n_used}", flush=True)
 
-    print(f"[{scene}] fused {n_used} expected-depth views")
+    print(f"[{scene}] fused {n_used} {args.depth_mode}-depth views")
     mesh = volume.extract_triangle_mesh()
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_vertices()
