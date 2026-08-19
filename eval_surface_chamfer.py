@@ -48,7 +48,7 @@ from powerfoam.rasterize import VisOptions
 from run_cluster_classify_eval import SCENES
 
 
-def render_median_depths(model, cameras, max_views=None, min_alpha=0.5):
+def render_median_depths(model, cameras, max_views=None, min_alpha=0.5, quantile=0.5):
     """Yield (index, camera, HxW median-depth) per view, with depth zeroed wherever the
     ray did not actually terminate on solid geometry.
 
@@ -60,7 +60,7 @@ def render_median_depths(model, cameras, max_views=None, min_alpha=0.5):
     vis_options = VisOptions()
     vis_options.transmittance_threshold = 1e-3
     vis_options.max_intersections = 1024
-    vis_options.depth_quantile = 0.5          # median depth -- see module docstring
+    vis_options.depth_quantile = quantile     # 0.5 = median depth -- see module docstring
     vis_options.bkgd_color = wp.vec3f(0.0, 0.0, 0.0)
     n = len(cameras) if max_views is None else min(max_views, len(cameras))
     for i in range(n):
@@ -131,6 +131,10 @@ def main():
                         "computing completeness (0 disables); guards against charging "
                         "never-observed geometry against the reconstruction")
     p.add_argument("--thresh", type=float, default=0.05, help="F-score distance threshold (m)")
+    p.add_argument("--depth-quantile", type=float, default=0.5,
+                   help="transmittance crossing used as the surface. 0.5 = median (the 2DGS "
+                        "convention). Lower values take the FRONT of a soft density slab, which "
+                        "matters for a volumetric representation whose cells are several cm thick.")
     p.add_argument("--min-alpha", type=float, default=0.5,
                    help="minimum accumulated opacity for a pixel's depth to be fused")
     p.add_argument("--out-mesh", default=None)
@@ -159,7 +163,7 @@ def main():
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.NoColor)
 
     n_used = 0
-    for i, cam, depth in render_median_depths(model, cameras, args.max_views, args.min_alpha):
+    for i, cam, depth in render_median_depths(model, cameras, args.max_views, args.min_alpha, args.depth_quantile):
         valid = np.isfinite(depth) & (depth > 0)
         if valid.sum() < 100:
             continue
