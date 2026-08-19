@@ -34,3 +34,5 @@ notebooks/__marimo__/
 
 # Large local model/checkpoint cache, not project source.
 /checkpoints
+# 3.2GB of Gaussian baseline checkpoints/features -- data, not code
+/gaussian_baseline_scannet
