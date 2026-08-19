@@ -1,14 +1,26 @@
-"""Extended surface metrics: Chamfer, Hausdorff (HD / HD95), and voxel-occupancy
-IoU / Dice / F1 / precision / recall.
+"""Extended surface metrics, with DELIBERATELY PRECISE NAMING.
 
-Two families, deliberately kept distinct:
+Naming rule enforced here: a metric is either
+  (a) a DISTANCE, reported in metres/cm, named MAE / RMSE / median / Hausdorff -- never
+      "accuracy", which is dimensionless; or
+  (b) a FRACTION in [0,1] produced by a decision criterion (a distance threshold, or voxel
+      occupancy), named precision / recall / F1 / IoU / Dice, always with the criterion
+      stated.
+The MVS literature (DTU, and 2DGS/GOF/TrimGS following it) calls the mean rec->GT distance
+"accuracy" and the mean GT->rec distance "completeness". Those are mean absolute errors, not
+accuracies -- a fraction cannot be 1.33cm. We report them as MAE and note the legacy names
+only where needed to line up with published tables.
 
-* **Point-based** (accuracy / completeness / CD-L1 / HD / HD95, and the threshold F-score):
+Two families, kept distinct:
+
+* **Distances** (mae_rec2gt / mae_gt2rec / chamfer_l1 / rmse / median / HD / HD95):
   nearest-neighbour distances between sampled reconstruction points and GT points.
   HD is the raw max distance -- extremely outlier-sensitive, one stray triangle sets it --
   so HD95 (95th percentile) is reported alongside and is the number to trust.
 
-* **Voxel-occupancy** (IoU / Dice / precision / recall): both sides are voxelized on a
+* **Fractions with a criterion**: threshold-based precision/recall/F1 (criterion: nearest
+  neighbour within tau) and voxel-occupancy IoU / Dice / precision / recall (criterion:
+  voxel contains surface). both sides are voxelized on a
   shared grid and compared as occupancy sets. NOTE the ScanNet GT here is a POINT CLOUD
   (Pointcept `coord.npy`), not a watertight mesh, so this is **surface**-occupancy, not
   solid-volume occupancy: a voxel counts as occupied if the surface passes through it.
@@ -63,15 +75,21 @@ def full_surface_metrics(rec_pts, gt_pts, thresh=0.05, voxels=(0.02, 0.05)):
     prec = float((d1 < thresh).mean())
     recl = float((d2 < thresh).mean())
     out = {
-        "accuracy": float(d1.mean()), "completeness": float(d2.mean()),
+        # --- distances (metres). d1 = rec->GT, d2 = GT->rec ---
+        "mae_rec2gt": float(d1.mean()),          # MVS papers call this "accuracy"
+        "mae_gt2rec": float(d2.mean()),          # MVS papers call this "completeness"
         "chamfer_l1": float((d1.mean() + d2.mean()) / 2),
-        "acc_median": float(np.median(d1)), "comp_median": float(np.median(d2)),
+        "rmse_rec2gt": float(np.sqrt((d1 ** 2).mean())),
+        "rmse_gt2rec": float(np.sqrt((d2 ** 2).mean())),
+        "median_rec2gt": float(np.median(d1)), "median_gt2rec": float(np.median(d2)),
         "hd": float(max(d1.max(), d2.max())),
         "hd95": float(max(np.percentile(d1, 95), np.percentile(d2, 95))),
         "hd95_rec2gt": float(np.percentile(d1, 95)),
         "hd95_gt2rec": float(np.percentile(d2, 95)),
-        "precision_pt": prec, "recall_pt": recl,
-        "fscore_pt": float(2 * prec * recl / max(prec + recl, 1e-9)),
+        # --- fractions in [0,1]; criterion = nearest neighbour within `thresh` ---
+        "threshold_m": thresh,
+        "precision@tau": prec, "recall@tau": recl,
+        "f1@tau": float(2 * prec * recl / max(prec + recl, 1e-9)),
         "n_rec": int(len(rec_pts)), "n_gt": int(len(gt_pts)),
     }
     out["voxel_metrics"] = [voxel_occupancy_metrics(rec_pts, gt_pts, v) for v in voxels]
@@ -79,11 +97,14 @@ def full_surface_metrics(rec_pts, gt_pts, thresh=0.05, voxels=(0.02, 0.05)):
 
 
 def print_metrics(tag, m):
+    tau = m.get("threshold_m", 0.05) * 100
     print(f"[{tag}]")
-    print(f"  point : acc={m['accuracy']*100:6.2f}cm comp={m['completeness']*100:6.2f}cm "
-          f"CD-L1={m['chamfer_l1']*100:6.2f}cm  F@5cm={m['fscore_pt']:.3f}")
-    print(f"  hausdorff: HD={m['hd']*100:7.2f}cm  HD95={m['hd95']*100:6.2f}cm "
+    print(f"  distances (cm): MAE rec->GT={m['mae_rec2gt']*100:6.2f}  MAE GT->rec={m['mae_gt2rec']*100:6.2f}  "
+          f"CD-L1={m['chamfer_l1']*100:6.2f}  RMSE={m['rmse_rec2gt']*100:6.2f}/{m['rmse_gt2rec']*100:.2f}")
+    print(f"  hausdorff (cm): HD={m['hd']*100:7.2f}  HD95={m['hd95']*100:6.2f} "
           f"(rec->gt {m['hd95_rec2gt']*100:.2f}, gt->rec {m['hd95_gt2rec']*100:.2f})")
+    print(f"  fractions (criterion: NN within {tau:.0f}cm): "
+          f"precision={m['precision@tau']:.3f} recall={m['recall@tau']:.3f} F1={m['f1@tau']:.3f}")
     for v in m["voxel_metrics"]:
         print(f"  voxel {v['voxel']*100:.0f}cm: IoU={v['iou']:.4f} Dice/F1={v['dice']:.4f} "
               f"prec={v['precision']:.4f} rec={v['recall']:.4f} "

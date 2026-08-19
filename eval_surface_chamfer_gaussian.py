@@ -66,8 +66,8 @@ def render_median_depth(means, quats, scales, opacities, colors, sh_degree,
         if not bool(m.any()):
             continue
         _, ra, _ = rasterization(
-            means=means[m], quats=quats[m], scales=torch.exp(scales[m]),
-            opacities=torch.sigmoid(opacities[m]), colors=ones[m],
+            means=means[m], quats=quats[m], scales=scales[m],
+            opacities=opacities[m], colors=ones[m],
             viewmats=viewmat, Ks=K[None], width=W, height=H,
             sh_degree=None, render_mode="RGB", packed=False)
         A = ra[0, ..., 0]
@@ -85,7 +85,15 @@ def render_median_depth(means, quats, scales, opacities, colors, sh_degree,
 
 
 def load_splats(ckpt_path, device):
-    """splat-distiller .pt ({'splats': {...}}) or a graphdeco-style .ply."""
+    """splat-distiller .pt ({'splats': {...}}) or a graphdeco-style .ply.
+
+    Returns ACTIVATED scales/opacities in both cases, because the two sources differ:
+    the .pt checkpoint stores raw parameters (log-scale, logit-opacity) and needs
+    exp/sigmoid, whereas gsplat_ext's GaussianPrimitive._load_ply already applies them
+    (verified on OpenGaussian's converted.ply: scales all positive with mean 0.041,
+    opacities inside [0,1]). Applying exp/sigmoid a second time on the .ply path would
+    inflate every Gaussian by e^scale and squash opacity toward 0.5.
+    """
     if str(ckpt_path).endswith(".ply"):
         from gsplat_ext import GaussianPrimitive
         prim = GaussianPrimitive()
@@ -96,7 +104,8 @@ def load_splats(ckpt_path, device):
                 int(g.get("sh_degree", 3)))
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)["splats"]
     colors = torch.cat([ck["sh0"], ck["shN"]], dim=1)
-    return (ck["means"], ck["quats"], ck["scales"], ck["opacities"], colors, 3)
+    return (ck["means"], ck["quats"], torch.exp(ck["scales"]),
+            torch.sigmoid(ck["opacities"]), colors, 3)
 
 
 def main():
@@ -149,8 +158,8 @@ def main():
                 viewmat, K, W, H, n_slices=args.n_slices, far=args.depth_trunc)
         else:
             rc, ra, _ = rasterization(
-                means=means, quats=quats, scales=torch.exp(scales),
-                opacities=torch.sigmoid(opacities), colors=colors,
+                means=means, quats=quats, scales=scales,
+                opacities=opacities, colors=colors,
                 viewmats=viewmat, Ks=K[None], width=W, height=H,
                 sh_degree=sh_degree, render_mode="RGB+ED", packed=False)
             depth = rc[0, ..., -1]                       # expected depth, camera-space z
