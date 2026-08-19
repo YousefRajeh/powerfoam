@@ -39,6 +39,31 @@ from diagnose_scannet_miou import load_foam
 from run_cluster_classify_eval import SCENES, CLASS_SETS
 
 
+def build_knn_csr(positions, valid_mask_t, K=30, block=8192):
+    """NormLift's exact neighbor semantics: K Euclidean nearest neighbors (among valid
+    primitives), returned as the same CSR (adjacent, offsets) the refinement consumes.
+    Blocked cdist keeps memory bounded at (block x P_valid)."""
+    device = positions.device
+    vi = torch.where(valid_mask_t)[0]
+    vpos = positions[vi]
+    P = positions.shape[0]
+    neigh = torch.zeros(P, K, dtype=torch.long, device=device)
+    for s in range(0, P, block):
+        e = min(s + block, P)
+        d = torch.cdist(positions[s:e], vpos)
+        idx = d.topk(K + 1, largest=False).indices  # +1: self may be included
+        mapped = vi[idx]
+        rows = torch.arange(s, e, device=device).unsqueeze(1)
+        not_self = mapped != rows
+        # keep first K non-self entries per row
+        keep = torch.where(not_self, torch.arange(K + 1, device=device).expand_as(mapped), K + 1)
+        order = keep.argsort(dim=1)[:, :K]
+        neigh[s:e] = torch.gather(mapped, 1, order)
+    adjacent = neigh.reshape(-1)
+    offsets = torch.arange(0, (P + 1) * K, K, device=device)
+    return adjacent, offsets
+
+
 def mode_vote_refine(unit, R, positions, adjacent, offsets, sigma_d=None,
                      tau=0.8, gamma=0.05, delta=0.1, chunk=8192):
     """One conservative mode-voting pass. unit: (P,C) unit features (invalid rows zero);
@@ -100,6 +125,7 @@ def main():
     p.add_argument("--gamma", type=float, default=0.05)
     p.add_argument("--delta", type=float, default=0.1)
     p.add_argument("--passes", type=int, default=1)
+    p.add_argument("--neighbors", choices=["adjacency", "knn30"], default="adjacency")
     p.add_argument("--output", default=None)
     args = p.parse_args()
 
@@ -133,6 +159,8 @@ def main():
                             f"{ckpt_dir}/config.yaml", "--output", adjacency_path], check=True)
         adj = torch.load(adjacency_path, map_location=device, weights_only=True)
         adjacent, offsets = adj["adjacent"].to(device).long(), adj["offsets"].to(device).long()
+        if args.neighbors == "knn30":
+            adjacent, offsets = build_knn_csr(torch.from_numpy(centers).to(device).float(), vm_t, K=30)
 
         refined = unit
         for _ in range(args.passes):
