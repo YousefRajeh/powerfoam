@@ -113,6 +113,8 @@ def accumulate_feature_stats_for_views(
     max_hits_per_pixel=64,
     batch_size=4,
     weight_transform=None,
+    column_map=None,
+    num_columns=None,
 ):
     """Stream-accumulate per-primitive sufficient statistics (support, support2,
     numerator, sq_numerator -- see AccumulatedFeatureStats) across ANY number of
@@ -195,7 +197,7 @@ def accumulate_feature_stats_for_views(
         num_pixels = H * W
         fmap = feature_map_loader(view_id)
         if stats is None:
-            stats = AccumulatedFeatureStats.zeros(model.points.shape[0], fmap.shape[-1], device=device)
+            stats = AccumulatedFeatureStats.zeros((num_columns if num_columns is not None else model.points.shape[0]), fmap.shape[-1], device=device)
 
         out_col, out_val, slot_counter, overflow_counter, _ = model.export_feature_operator(
             camera,
@@ -231,6 +233,18 @@ def accumulate_feature_stats_for_views(
             out_val = out_val * out_val
 
         cols = out_col[keep_mask].long()
+        # column_map: remap primitive columns to REGION columns (N2/N3 "cluster-then-
+        # resolve"). The streaming solve then medians over VIEWS per REGION -- a whole
+        # bad view can be rejected for a region, which per-cell medians cannot do since
+        # each cell sees a different view subset. Entries < 0 are dropped.
+        if column_map is not None:
+            cols = column_map[cols]
+            ok = cols >= 0
+            if not bool(ok.all()):
+                cols = cols[ok]
+                keep_idx = torch.where(keep_mask)[0][ok]
+                keep_mask = torch.zeros_like(keep_mask)
+                keep_mask[keep_idx] = True
         vals = out_val.reshape(-1)[keep_mask]
         row_local = torch.arange(num_pixels, device=device).repeat_interleave(max_hits_per_pixel)[keep_mask]
 
