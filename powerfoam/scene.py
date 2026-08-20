@@ -651,10 +651,14 @@ class PowerfoamScene(nn.Module):
             args.points_lr_final,
             max_steps=iterations,
         )
+        # Density is the only warmed group here, as in VoroTracing (theirs is 2000 steps;
+        # ours has always been 1000 -- now configurable so the two can be compared). The
+        # warmup matters most for sigma = exp(rho), where the effective step grows with the
+        # density itself and an early over-shoot is unrecoverable.
         self.density_scheduler = get_cosine_scheduler(
             args.density_lr_init,
             args.density_lr_final,
-            warmup_steps=1_000,
+            warmup_steps=getattr(args, "density_warmup_steps", 1_000),
             max_steps=iterations,
         )
         self.radii_scheduler = get_cosine_scheduler(

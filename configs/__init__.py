@@ -93,8 +93,17 @@ class Params:
     # cells that should be empty settle at a low but non-zero density" -- is our
     # interior-non-owner problem. "softplus" (default) keeps the historical behaviour.
     density_activation: str = "softplus"
+    # Linear warmup on the density LR. 1000 was hardcoded historically; VoroTracing uses
+    # 2000 and it is the only group they warm. Exposed so the two can be A/B'd, since the
+    # exponential parameterization is far more sensitive to an early overshoot.
+    density_warmup_steps: int = 1_000
     distortion_weight: float = 0.0
-    distortion_quantiles: tuple[float, float] = (0.1, 0.9)
+    # MUST be list[float], never tuple: train.py dumps vars(args) with yaml.dump, and a
+    # tuple serializes as `!!python/tuple`, which configargparse cannot read back. That
+    # silently breaks EVERY script that reloads a checkpoint's config.yaml (load_foam and
+    # therefore every eval in this project). A list round-trips as an inline flow sequence.
+    distortion_quantiles: list[float] = dataclasses.field(
+        default_factory=lambda: [0.1, 0.9])
     distortion_min_alpha: float = 0.5
     experiment_name: str = ""
     dry_run: bool = False
