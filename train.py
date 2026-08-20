@@ -158,6 +158,18 @@ def train(args):
         )
         sigma_spatial_scheduler = get_cosine_scheduler(4.5, 1.5, args.iterations)
 
+        # Fixed scene scale for the surface-concentration term, measured ONCE from the
+        # initial point cloud. It must not be recomputed during training: the loss would
+        # then be able to shrink itself by moving points instead of by sharpening density,
+        # which is a degenerate optimum rather than the property we want.
+        with torch.no_grad():
+            _p = model.points.detach()
+            distortion_scale = float((_p.max(dim=0).values - _p.min(dim=0).values).norm())
+        if args.distortion_weight > 0:
+            print(f"[distortion] weight={args.distortion_weight} "
+                  f"quantiles={tuple(args.distortion_quantiles)} "
+                  f"scene_diag={distortion_scale:.3f}")
+
         with tqdm.trange(args.iterations, desc="Training") as train:
             for i in train:
                 if viewer is not None:
@@ -200,10 +212,38 @@ def train(args):
                     # the rendered depth (median quantile) to (a) build a
                     # validity mask and (b) compute finite-difference normals
                     # if Metric3D is not used.
+                    # Quantile layout is built once so normal supervision and the
+                    # surface-concentration regulariser can share ONE render. The kernel
+                    # walks quantiles in order, so they are requested sorted and the
+                    # positions are recorded to index the result afterwards.
+                    # These are TRANSMITTANCE thresholds, not quantiles of the termination
+                    # distribution: the kernel emits the depth at which transmittance first
+                    # falls below each value. Two consequences, both of which silently
+                    # produce garbage if ignored:
+                    #   1. The kernel advances a forward-only index, and transmittance
+                    #      decreases monotonically, so the list MUST be DESCENDING. Passing
+                    #      ascending values makes every threshold fire at nearly the same
+                    #      depth (the deepest one), collapsing the spread to ~0.
+                    #   2. A HIGH threshold (0.9) is crossed EARLY => near depth; a LOW one
+                    #      (0.1) is crossed late => far depth. So the interval width is
+                    #      depth(low) - depth(high), not the other way round.
+                    q_list, q_median_idx, q_near_idx, q_far_idx = [], None, None, None
                     if args.normal_supervision:
-                        depth_quantiles = 0.5 * torch.ones(
-                            *rgb_gt.shape[:-1], 1, device=model.device
-                        )
+                        q_list.append(0.5)
+                    if args.distortion_weight > 0:
+                        t_far, t_near = args.distortion_quantiles   # e.g. (0.1, 0.9)
+                        q_list.extend([t_far, t_near])
+                    if q_list:
+                        q_list = sorted(set(q_list), reverse=True)   # DESCENDING, required
+                        if args.normal_supervision:
+                            q_median_idx = q_list.index(0.5)
+                        if args.distortion_weight > 0:
+                            q_near_idx = q_list.index(t_near)
+                            q_far_idx = q_list.index(t_far)
+                    if q_list:
+                        depth_quantiles = torch.tensor(
+                            q_list, device=model.device, dtype=torch.float32
+                        ).expand(*rgb_gt.shape[:-1], len(q_list)).contiguous()
                     else:
                         depth_quantiles = None
 
@@ -240,7 +280,8 @@ def train(args):
                     if args.normal_supervision:
                         # depth has shape (H, W, 1) since we requested a
                         # single quantile above.
-                        valid_depth_mask = (depth > 0).all(dim=-1)
+                        median_depth_slice = depth[..., q_median_idx : q_median_idx + 1]
+                        valid_depth_mask = (median_depth_slice > 0).all(dim=-1)
                         if args.use_metric3d:
                             normal_loss += (
                                 F.mse_loss(
@@ -251,7 +292,7 @@ def train(args):
                             )
                         else:
                             median_depth = depth_bilateral_filter(
-                                depth,
+                                median_depth_slice,
                                 sigma_spatial=sigma_spatial_scheduler(i),
                                 sigma_color=0.5,
                             )
@@ -273,6 +314,40 @@ def train(args):
                     w_contrib = contrib_loss_scheduler(i)
                     torch.cuda.nvtx.range_pop()  # Contribution
 
+                    torch.cuda.nvtx.range_push("Distortion")
+                    if args.distortion_weight > 0:
+                        # Width of the depth interval carrying the bulk of each ray's
+                        # transmittance. Small => the ray terminates on a thin surface;
+                        # large => weight is smeared through a soft slab, which is exactly
+                        # the volumetric-interior structure that broke facet-graph growing.
+                        d_far = depth[..., q_far_idx]     # transmittance fell to t_far
+                        d_near = depth[..., q_near_idx]   # transmittance fell to t_near
+                        # Only rays that actually hit something can be asked to be thin;
+                        # background rays legitimately have no surface and must not be
+                        # pulled toward zero spread (that would push density into empty
+                        # space to manufacture a crossing).
+                        hit = (alpha >= args.distortion_min_alpha) & (d_far > 0) & (d_near > 0)
+                        if i % 100 == 0:
+                            print(f"[dbg] iter {i} alpha[min={float(alpha.min()):.3f} "
+                                  f"max={float(alpha.max()):.3f} mean={float(alpha.mean()):.3f}] "
+                                  f"a>=thr={int((alpha>=args.distortion_min_alpha).sum())} "
+                                  f"d_far>0={int((d_far>0).sum())} d_near>0={int((d_near>0).sum())} "
+                                  f"hit={int(hit.sum())} of {alpha.numel()}", flush=True)
+                        if hit.any():
+                            spread = (d_far - d_near).clamp_min(0.0)[hit]
+                            # scale-free: a 5cm slab means something different in a
+                            # doll-house and a lecture hall, so normalise by scene scale
+                            distortion_loss = (spread / distortion_scale).mean()
+                            if i % 100 == 0:
+                                print(f"[distortion] iter {i}: hit={int(hit.sum())} "
+                                      f"mean_spread={float(spread.mean()):.4f}m "
+                                      f"loss={float(distortion_loss):.6f}", flush=True)
+                        else:
+                            distortion_loss = torch.zeros((), device=model.device)
+                    else:
+                        distortion_loss = torch.zeros((), device=model.device)
+                    torch.cuda.nvtx.range_pop()  # Distortion
+
                     torch.cuda.nvtx.range_push("Interpenetration")
                     interpenetration_loss = model.interpenetration().sum()
                     w_interpenetration = interpenetration_loss_scheduler(i)
@@ -284,6 +359,7 @@ def train(args):
                         + w_normal * normal_loss
                         + w_contrib * contrib_loss
                         + w_interpenetration * interpenetration_loss
+                        + args.distortion_weight * distortion_loss
                     )
 
                     torch.cuda.nvtx.range_pop()  # Losses
@@ -295,6 +371,17 @@ def train(args):
                     torch.cuda.nvtx.range_push("Optimizer Step")
 
                     model.optimizer.step()
+
+                    # VoroTracing's trainer clamps log-density at 30, for a concrete
+                    # reason worth copying: a surface-concentration term keeps pushing
+                    # density up past full opacity, and with sigma = exp(rho) the
+                    # gradient of exp overflows fp32 and the parameter becomes NaN.
+                    # exp(30) is already totally opaque, so this clips nothing physical.
+                    # Softplus cannot run away like this, so the clamp is applied only to
+                    # the exponential parameterization.
+                    if getattr(args, "density_activation", "softplus") == "exp":
+                        with torch.no_grad():
+                            model.density.clamp_(max=30.0)
 
                     torch.cuda.nvtx.range_pop()  # Optimizer Step
 
@@ -314,6 +401,9 @@ def train(args):
                     writer.add_scalar("train/contrib_loss", contrib_loss.item(), i)
                     writer.add_scalar(
                         "train/interpenetration_loss", interpenetration_loss.item(), i
+                    )
+                    writer.add_scalar(
+                        "train/distortion_loss", float(distortion_loss), i
                     )
 
                     num_points = model.points.shape[0]

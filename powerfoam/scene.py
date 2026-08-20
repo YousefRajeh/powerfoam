@@ -158,9 +158,18 @@ class PowerfoamScene(nn.Module):
         quaternions = quaternions / quaternions.norm(dim=-1, keepdim=True)
         self.quaternions = nn.Parameter(quaternions)
 
-        density = (
-            torch.ones(self.points.shape[0], dtype=self.tscalar, device=device) * 1e-1
-        )
+        # Density is stored as a raw parameter and activated in get_density(). The two
+        # supported activations need DIFFERENT raw inits to start from the same effective
+        # density: softplus(x, beta=100) ~= max(0, x) for |x| >> 1/beta, so the historical
+        # raw init of 0.1 IS sigma ~= 0.1; the exponential parameterization needs
+        # rho = log(sigma) to match it.
+        sigma0 = 1e-1
+        if getattr(self.args, "density_activation", "softplus") == "exp":
+            density = torch.full((self.points.shape[0],), float(np.log(sigma0)),
+                                 dtype=self.tscalar, device=device)
+        else:
+            density = torch.ones(self.points.shape[0], dtype=self.tscalar,
+                                 device=device) * sigma0
         self.density = nn.Parameter(density)
 
         texel_sites = (
@@ -268,6 +277,31 @@ class PowerfoamScene(nn.Module):
         self.adjacency, self.adjacency_offsets = self.aabb_tree.build_cech_complex()
 
     def get_density(self):
+        """Activation for the raw density parameter.
+
+        "exp" implements VoroTracing's (arXiv 2608.17682, Sec 5.4) scale-invariant
+        parameterization sigma = exp(rho). Since d(sigma)/d(rho) = sigma and
+        sigma_i * delta_i = -ln(1 - alpha_i), the gradient reduces to
+
+            dL/drho = dL/dalpha * (1 - alpha) * ln(1 / (1 - alpha))
+
+        in which THE SEGMENT LENGTH CANCELS: two cells at equal opacity get equal gradient
+        magnitude no matter how large or small they are. Under softplus the segment length
+        does not cancel, so smaller cells receive proportionally weaker gradients despite
+        needing higher density -- the paper attributes "floaters and a persistent haze,
+        where large cells that should be empty settle at a low but non-zero density" to
+        exactly that bias.
+
+        That failure mode is our interior-cell problem: ~90% of our cells are interior
+        non-owners, which is what broke every facet-graph clustering method we tried. It
+        may also confound the measured support ~ r^1.98 law, since a size-dependent
+        gradient is itself a size-dependent coupling between a cell's radius and how much
+        it learns.
+
+        Default stays "softplus" so existing checkpoints and configs are unaffected.
+        """
+        if getattr(self.args, "density_activation", "softplus") == "exp":
+            return torch.exp(self.density)
         return F.softplus(self.density, beta=100)
 
     def get_normals(self):

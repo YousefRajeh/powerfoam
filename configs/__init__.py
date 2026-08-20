@@ -71,6 +71,31 @@ class Params:
     interpenetration_weight: float
     densify_from: int
     densify_until: int
+    # Surface-concentration regulariser (OFF by default -- 0.0 leaves training bit-identical
+    # to every run made before it existed). Motivated by VoroTracing (arXiv 2608.17682),
+    # which applies Mip-NeRF 360's distortion loss to a Voronoi field and reports that the
+    # learned density becomes "strongly bimodal -- cells are either near-transparent or
+    # near-opaque". We want that property for a SEMANTIC reason, not a rendering one: ~90% of
+    # our cells are interior non-owners, which is why every adjacency-growing method we tried
+    # blobbed through object interiors (geodesic FPS -5 mIoU, coherence-gated growth -12.3
+    # with 3/10 catastrophic collapses). If opacity is bimodal, "is this cell on a surface"
+    # becomes a trained property instead of a threshold we have to guess per scene.
+    #
+    # NOT literally Mip-NeRF 360's L_dist: that needs per-sample weights w_k = T_k*alpha_k
+    # inside the warp ray kernel. This penalises the INTERQUANTILE DEPTH SPREAD instead --
+    # the distance between the depths at which transmittance crosses two quantiles, which is
+    # the width of the interval holding most of the ray's weight. Driving it to zero forces
+    # transmittance to fall 1 -> 0 abruptly, i.e. the same surface-concentrated opacity, and
+    # it is differentiable through the renderer's EXISTING depth-quantile backward pass.
+    # VoroTracing (arXiv 2608.17682) Sec 5.4: sigma = exp(rho) instead of softplus. The
+    # segment length cancels from the gradient, so cells of equal opacity are optimized
+    # equally regardless of size. Their reported symptom of the softplus bias -- "large
+    # cells that should be empty settle at a low but non-zero density" -- is our
+    # interior-non-owner problem. "softplus" (default) keeps the historical behaviour.
+    density_activation: str = "softplus"
+    distortion_weight: float = 0.0
+    distortion_quantiles: tuple[float, float] = (0.1, 0.9)
+    distortion_min_alpha: float = 0.5
     experiment_name: str = ""
     dry_run: bool = False
     viewer: bool = False
