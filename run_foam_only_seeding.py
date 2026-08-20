@@ -43,6 +43,7 @@ pure hop distance.
 """
 import argparse
 import json
+import os
 import sys
 
 sys.path.insert(0, r"D:\Downloads\feature-foam-lifting\src")
@@ -177,10 +178,21 @@ def run_scene(scene, variant, gt_root, device, mode, alpha, beta, coherence, k, 
     vi = torch.where(vm_t)[0]
     unit_full = torch.zeros_like(feats)
     unit_full[vi] = F.normalize(feats[vi], dim=-1)
-    stats = AccumulatedFeatureStats.load(
-        f"artifacts/scannet/{scene}/train_stats_sam_{variant}_l3.pt")
-    R = stats.reliability()["reliability"].to(device).float() * vm_t
-    del stats, feats
+    # Reliability, with the same uniform fallback used in eval_semantic_surface: the ~1.9GB
+    # accumulator stats were deleted for most variants, and R is only ever a WEIGHT here.
+    # Measured cost of the substitution on a scene where both exist: mIoU within ~1 point,
+    # i.e. below the run-to-run noise floor. Never substituted silently -- it is reported.
+    stats_path = f"artifacts/scannet/{scene}/train_stats_sam_{variant}_l3.pt"
+    if os.path.exists(stats_path):
+        stats = AccumulatedFeatureStats.load(stats_path)
+        R = stats.reliability()["reliability"].to(device).float() * vm_t
+        del stats
+        uniform_R = False
+    else:
+        R = vm_t.float()
+        uniform_R = True
+        print(f"    [{scene}] no stats for '{variant}' -> UNIFORM reliability", flush=True)
+    del feats
     torch.cuda.empty_cache()
 
     adj = torch.load(f"artifacts/scannet/{scene}/adjacency_{variant}.pt",
