@@ -21,7 +21,11 @@ def str_to_bool(v):
 def add_group(parser: configargparse.ArgParser, group_class):
     fields = dict(inspect.getmembers(group_class))["__dataclass_fields__"]
     for name, field in fields.items():
-        required = field.default == dataclasses.MISSING
+        # A dataclass field with default_factory (needed for mutable defaults such as
+        # list[float]) has field.default == MISSING, which would otherwise mark it REQUIRED
+        # on the command line. Resolve the factory to get the real default.
+        has_factory = field.default_factory is not dataclasses.MISSING
+        required = field.default is dataclasses.MISSING and not has_factory
         t = field.type
         nargs = None
         if hasattr(t, "__origin__") and hasattr(t, "__args__"):
@@ -50,7 +54,8 @@ def add_group(parser: configargparse.ArgParser, group_class):
             assert field.default == False
             parser.add_argument(f"--{name}", action="store_true")
         else:
-            parser.add_argument(f"--{name}", nargs=nargs, type=t, default=field.default)
+            default = field.default_factory() if has_factory else field.default
+            parser.add_argument(f"--{name}", nargs=nargs, type=t, default=default)
 
     def extract(args):
         kwargs = {}
