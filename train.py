@@ -19,6 +19,7 @@ from powerfoam.scene import PowerfoamScene
 from powerfoam.geometry import normals_from_depth, depth_bilateral_filter
 from powerfoam.scheduling import get_exp_scheduler, get_cosine_scheduler
 from powerfoam.metrics import psnr, ssim, ssim_eval, lpips_eval
+from powerfoam.distortion import exact_distortion, stratified_thresholds
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -230,14 +231,25 @@ def train(args):
                     q_list, q_median_idx, q_near_idx, q_far_idx = [], None, None, None
                     if args.normal_supervision:
                         q_list.append(0.5)
-                    if args.distortion_weight > 0:
+                    exact_dist = (args.distortion_weight > 0
+                                  and args.distortion_mode == "exact")
+                    if exact_dist:
+                        # stratified thresholds: each carries EXACTLY 1/K of the terminated
+                        # mass, so the distortion weights are known constants and only the
+                        # depths need rendering. Descending, as the kernel requires.
+                        q_exact = stratified_thresholds(
+                            args.distortion_num_quantiles, model.device).tolist()
+                        q_list.extend(q_exact)
+                    elif args.distortion_weight > 0:
                         t_far, t_near = args.distortion_quantiles   # e.g. (0.1, 0.9)
                         q_list.extend([t_far, t_near])
                     if q_list:
                         q_list = sorted(set(q_list), reverse=True)   # DESCENDING, required
                         if args.normal_supervision:
                             q_median_idx = q_list.index(0.5)
-                        if args.distortion_weight > 0:
+                        if exact_dist:
+                            q_exact_idx = [q_list.index(v) for v in q_exact]
+                        elif args.distortion_weight > 0:
                             q_near_idx = q_list.index(t_near)
                             q_far_idx = q_list.index(t_far)
                     if q_list:
@@ -315,7 +327,28 @@ def train(args):
                     torch.cuda.nvtx.range_pop()  # Contribution
 
                     torch.cuda.nvtx.range_push("Distortion")
-                    if args.distortion_weight > 0:
+                    if args.distortion_weight > 0 and args.distortion_mode == "exact":
+                        dsel = depth[..., q_exact_idx]
+                        # Channel control: detaching a parameter's contribution here is what
+                        # separates "make the material opaque" (density) from "make the cell
+                        # thinner" (radii). Implemented by detaching the rendered depth w.r.t.
+                        # the channel we want silent -- see the ablation in the method note.
+                        loss_rays, nbins = exact_distortion(
+                            dsel, torch.tensor(q_exact, device=model.device))
+                        # NO ray mask, matching VoroTracing: a ray that never becomes opaque
+                        # has no reached thresholds, so every bin mass is zero and it
+                        # contributes exactly 0 to the mean. Gating on alpha instead would
+                        # (a) silence the loss entirely early in training, when the scene is
+                        # still transparent and geometry is most malleable, and (b) bias the
+                        # average toward already-converged rays. Averaging over all rays keeps
+                        # the estimator unbiased and lets the term act from step 0.
+                        distortion_loss = loss_rays.mean()
+                        if i % 100 == 0:
+                            print(f"[distortion/exact] iter {i}: "
+                                  f"rays_with_2+_bins={int((nbins > 1).sum())} "
+                                  f"mean_bins={nbins.float().mean():.2f} "
+                                  f"loss={float(distortion_loss):.6e}", flush=True)
+                    elif args.distortion_weight > 0:
                         # Width of the depth interval carrying the bulk of each ray's
                         # transmittance. Small => the ray terminates on a thin surface;
                         # large => weight is smeared through a soft slab, which is exactly
@@ -359,13 +392,40 @@ def train(args):
                         + w_normal * normal_loss
                         + w_contrib * contrib_loss
                         + w_interpenetration * interpenetration_loss
-                        + args.distortion_weight * distortion_loss
                     )
+                    # CHANNEL CONTROL -- the power-diagram-native experiment.
+                    # VoroTracing routes the distortion gradient to DENSITY ONLY, because a
+                    # midpoint bisector cannot move without moving a site and dragging every
+                    # other boundary of that cell with it. Our power weights translate a
+                    # cell's planes WITHOUT moving its center, so the same loss can also mean
+                    # "make this cell thinner". Isolating a channel needs the distortion
+                    # gradient computed separately and added only to the chosen parameters --
+                    # a plain sum into `loss` would send it everywhere.
+                    dist_params, dist_names = [], []
+                    if args.distortion_weight > 0 and args.distortion_channel != "both":
+                        if args.distortion_channel in ("density", "both"):
+                            dist_params.append(model.density); dist_names.append("density")
+                        if args.distortion_channel in ("radii", "both"):
+                            dist_params.append(model.radii); dist_names.append("radii")
+                    if dist_params:
+                        dist_grads = torch.autograd.grad(
+                            args.distortion_weight * distortion_loss, dist_params,
+                            retain_graph=True, allow_unused=True)
+                    elif args.distortion_weight > 0:
+                        loss = loss + args.distortion_weight * distortion_loss
 
                     torch.cuda.nvtx.range_pop()  # Losses
                     torch.cuda.nvtx.range_push("Backward")
 
                     loss.backward()
+
+                    if dist_params:
+                        # add the isolated distortion gradient after the main backward, so it
+                        # reaches only the selected channel
+                        for p, g in zip(dist_params, dist_grads):
+                            if g is None:
+                                continue
+                            p.grad = g if p.grad is None else p.grad + g
 
                     torch.cuda.nvtx.range_pop()  # Backward
                     torch.cuda.nvtx.range_push("Optimizer Step")

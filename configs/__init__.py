@@ -102,6 +102,21 @@ class Params:
     # 2000 and it is the only group they warm. Exposed so the two can be A/B'd, since the
     # exponential parameterization is far more sensitive to an early overshoot.
     density_warmup_steps: int = 1_000
+    # "iqr"   = interquantile-spread surrogate. FALSIFIED as a substitute for L_dist: it is
+    #           a trimmed dispersion measure, provably blind to a 10% tail at ANY distance
+    #           (mass 0.9 at s=0 and 0.1 at s=D gives IQR 0 for every D while the true
+    #           Gini-mean-difference term grows as 0.18*D). Kept only as a cheap diagnostic.
+    # "exact" = the real Mip-NeRF 360 L_dist, evaluated on stratified transmittance
+    #           quantiles where the bin masses are exact constants and only the depths are
+    #           rendered. Verified against the O(K^2) definition to 1e-7.
+    distortion_mode: str = "iqr"
+    distortion_num_quantiles: int = 16
+    # WHERE the distortion gradient is allowed to act. This is the power-diagram-native
+    # question: VoroTracing routes it to DENSITY ONLY, because a midpoint bisector cannot
+    # move without moving a site. Our weights translate a cell's planes without moving its
+    # center, so "radii" lets the loss mean "make this cell thinner" instead of only "make
+    # this material more opaque". "both" is the full channel; "density" reproduces theirs.
+    distortion_channel: str = "both"
     distortion_weight: float = 0.0
     # MUST be list[float], never tuple: train.py dumps vars(args) with yaml.dump, and a
     # tuple serializes as `!!python/tuple`, which configargparse cannot read back. That

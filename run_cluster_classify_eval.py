@@ -43,6 +43,24 @@ SCENES = {
 CLASS_SETS = ["opengaussian19", "opengaussian15", "opengaussian10"]
 NUM_ROOTS = 64
 LEAVES_PER_ROOT = 5
+
+# Canonical HARDEST-FIRST scene order for sweeps. Put the scenes that would FALSIFY an idea
+# first, so a bad idea is killed in minutes instead of an hour, and state a kill criterion
+# before launching.
+#
+# Derivation (2026-08-20): the first three are where coherence-gated geodesic growing
+# collapsed outright -- scene0347_00 1.84, scene0070_00 0.42, scene0140_00 3.67 mIoU against a
+# ~40 baseline. 0645/0590 carry the lowest baseline mIoU (28.40 / 35.54) and the largest cell
+# counts (352k / 223k init points), so they stress memory and clustering together.
+#
+# The default (numeric) order is actively misleading: it starts with scene0000_00, the single
+# scene where the foam-only method won MOST. A +1.75 mIoU pilot on it reversed to -12.3 over
+# ten scenes. Easy-first ordering manufactures false progress.
+HARD_FIRST = [
+    "scene0347_00", "scene0070_00", "scene0140_00", "scene0645_00", "scene0590_00",
+    "scene0200_00", "scene0097_00", "scene0400_00", "scene0062_00", "scene0000_00",
+]
+
 K_FLAT = NUM_ROOTS * LEAVES_PER_ROOT  # 320, matching OpenGaussian's codebook size
 
 
