@@ -119,7 +119,8 @@ def semantic_surface_metrics(points, gt, pred, n_classes, tau=0.02):
 
 
 def predict_labels(scene, variant, gt_root, device, class_sets, uniform_R=False,
-                   protocol="champion"):
+                   protocol="champion", ckpt_dir=None, solved_path=None,
+                   stats_path_override=None, adjacency_path=None):
     """Return per-class-set labels under one of two protocols.
 
     protocol="champion" -- the validated raw-only stack (no templates): L3 features ->
@@ -138,8 +139,9 @@ def predict_labels(scene, variant, gt_root, device, class_sets, uniform_R=False,
     """
     split = SCENES[scene]
     gt_points, raw_labels, all_names = load_scannet_pointcept_gt(f"{gt_root}/{split}/{scene}", "segment20")
-    centers, radii = load_foam(f"output/scannet_{scene}_{variant}", device)
-    solved = torch.load(f"artifacts/scannet/{scene}/solved_geometric_median_{variant}_l3.pt",
+    centers, radii = load_foam(ckpt_dir or f"output/scannet_{scene}_{variant}", device)
+    solved = torch.load(solved_path or
+                        f"artifacts/scannet/{scene}/solved_geometric_median_{variant}_l3.pt",
                         map_location=device, weights_only=True)
     feats = solved["primitive_features"].to(device).float()
     vm = solved["valid_mask"].cpu().numpy()
@@ -154,7 +156,7 @@ def predict_labels(scene, variant, gt_root, device, class_sets, uniform_R=False,
     # It is never silently substituted: the caller must pass --uniform-reliability, the
     # choice is recorded in the output JSON, and its cost is measured on scene0000_00 where
     # both are available.
-    stats_path = f"artifacts/scannet/{scene}/train_stats_sam_{variant}_l3.pt"
+    stats_path = stats_path_override or f"artifacts/scannet/{scene}/train_stats_sam_{variant}_l3.pt"
     if protocol == "opengaussian":
         uniform_R = True          # unused by this path; kept uniform so nothing is loaded
     if uniform_R:
@@ -170,7 +172,7 @@ def predict_labels(scene, variant, gt_root, device, class_sets, uniform_R=False,
 
     adjacent = offsets = None
     if protocol == "champion":
-        adj = torch.load(f"artifacts/scannet/{scene}/adjacency_{variant}.pt",
+        adj = torch.load(adjacency_path or f"artifacts/scannet/{scene}/adjacency_{variant}.pt",
                          map_location=device, weights_only=True)
         adjacent, offsets = adj["adjacent"].to(device).long(), adj["offsets"].to(device).long()
         ref = unit_full
@@ -212,7 +214,16 @@ def predict_labels(scene, variant, gt_root, device, class_sets, uniform_R=False,
         pc[vi.cpu().numpy()] = vcls[leaf].cpu().numpy()
         pred = np.zeros(len(gt_t), dtype=np.int64)
         pred[owned] = pc[assigned[owned]] + 1
-        out[cs] = (gt_points, gt_t.numpy(), pred, len(tids) + 1, tnames)
+        # Per-GT-point REGION id (which of the 320 clusters owns it), carried alongside the
+        # class label. A wrong prediction that covers geometry far from the true object is
+        # either a feature error (that cell's CLIP vector is wrong) or a clustering-locality
+        # error (one region spans disconnected geometry and its single pooled label is
+        # broadcast to all of it). Colouring by region id distinguishes the two directly.
+        region_of_cell = np.full(centers.shape[0], -1, dtype=np.int64)
+        region_of_cell[vi.cpu().numpy()] = leaf.cpu().numpy()
+        region = np.full(len(gt_t), -1, dtype=np.int64)
+        region[owned] = region_of_cell[assigned[owned]]
+        out[cs] = (gt_points, gt_t.numpy(), pred, len(tids) + 1, tnames, region)
     del unit_full, feats, ref, R
     torch.cuda.empty_cache()
     out["_uniform_reliability"] = used_uniform
@@ -230,6 +241,10 @@ def main():
                    help="use R=1 on valid primitives instead of the accumulator's "
                         "reliability. Needed for the 9 scenes whose ~1.9GB stats were "
                         "deleted under the disk policy; cost measured on scene0000_00.")
+    p.add_argument("--ckpt-dir", default=None)
+    p.add_argument("--solved", default=None)
+    p.add_argument("--stats", default=None)
+    p.add_argument("--adjacency", default=None)
     p.add_argument("--protocol", choices=["champion", "opengaussian"], default="champion",
                    help="champion = validated raw-only stack (headline numbers); "
                         "opengaussian = protocol-matched baseline (two-level 64x5 codebook, "
@@ -244,9 +259,12 @@ def main():
     for scene in args.scenes.split(","):
         preds = predict_labels(scene, args.variant, args.gt_root, device, class_sets,
                                uniform_R=args.uniform_reliability,
-                               protocol=args.protocol)
+                               protocol=args.protocol, ckpt_dir=args.ckpt_dir,
+                               solved_path=args.solved,
+                               stats_path_override=args.stats,
+                               adjacency_path=args.adjacency)
         uniform_used = preds.pop("_uniform_reliability", False)
-        for cs, (pts, gt, pred, ncls, tnames) in preds.items():
+        for cs, (pts, gt, pred, ncls, tnames, region) in preds.items():
             _, miou, _, macc = calculate_metrics(torch.from_numpy(gt).long(),
                                                  torch.from_numpy(pred).long(), ncls)
             m = semantic_surface_metrics(pts, gt, pred, ncls, tau=args.tau)

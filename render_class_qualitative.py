@@ -83,7 +83,12 @@ def gaussian_predictions(scene, gt_root, ckpt, features, device, class_sets,
         pcls[vi] = vcls[leaf].cpu().numpy()
         pred = np.zeros(gt_points.shape[0], dtype=np.int64)
         pred[owned] = pcls[assigned[owned]] + 1
-        out[cs] = (gt_points, gt_t, pred, len(tids) + 1, tnames)
+        # per-GT-point region id, so the 3DGS side gets the same locality panel as foam
+        roc = np.full(np.asarray(means).shape[0], -1, dtype=np.int64)
+        roc[vi] = leaf.cpu().numpy()
+        reg = np.full(gt_points.shape[0], -1, dtype=np.int64)
+        reg[owned] = roc[assigned[owned]]
+        out[cs] = (gt_points, gt_t, pred, len(tids) + 1, tnames, reg)
     return out
 
 
@@ -115,6 +120,40 @@ def render_panel(ax, pts, gt, pred, c, name, iou, max_pts=90000, seed=0):
         ax.set_box_aspect((np.ptp(pts[:, 0]), np.ptp(pts[:, 1]), np.ptp(pts[:, 2])))
     except Exception:
         pass
+
+
+def render_region_panel(ax, pts, region, focus_mask, name, max_pts=90000, seed=0):
+    """Colour the SAME points by REGION ID rather than by predicted class.
+
+    `focus_mask` marks the points that were predicted as the class under inspection. If the
+    wrong far-away blob and the correct part share ONE region colour, a single cluster spans
+    disconnected geometry and its pooled label was broadcast across all of it -- a clustering
+    LOCALITY failure. If they are different regions that merely agree on a label, the fault is
+    in the features instead. The two have different fixes, so the figure has to separate them.
+    """
+    rng = np.random.default_rng(seed)
+    idx_bg = np.where(~focus_mask)[0]
+    if idx_bg.size > max_pts:
+        idx_bg = rng.choice(idx_bg, max_pts, replace=False)
+    ax.scatter(pts[idx_bg, 0], pts[idx_bg, 1], pts[idx_bg, 2],
+               s=0.28, c="#e8e8e8", alpha=0.13, linewidths=0, rasterized=True)
+    idx = np.where(focus_mask)[0]
+    if idx.size > max_pts:
+        idx = rng.choice(idx, max_pts, replace=False)
+    r = region[idx]
+    uniq = np.unique(r[r >= 0])
+    # hash region ids to well-separated hues so neighbouring ids are not similar colours
+    colors = plt.cm.tab20((np.mod(r * 7919, 20)).astype(int)) if uniq.size else None
+    ax.scatter(pts[idx, 0], pts[idx, 1], pts[idx, 2], s=1.0, c=colors,
+               alpha=0.9, linewidths=0, rasterized=True)
+    ax.set_title(f"{name}\nregions covering this prediction: {uniq.size}", fontsize=8)
+    ax.set_axis_off()
+    ax.view_init(elev=62, azim=-72)
+    try:
+        ax.set_box_aspect((np.ptp(pts[:, 0]), np.ptp(pts[:, 1]), np.ptp(pts[:, 2])))
+    except Exception:
+        pass
+    return uniq.size
 
 
 def main():
@@ -155,19 +194,26 @@ def main():
         print(f"[skip] 3DGS: {type(e).__name__}: {e}", flush=True)
 
     summary = {}
-    for label, (pts, gt, pred, ncls, tnames) in methods.items():
+    for label, (pts, gt, pred, ncls, tnames, region) in methods.items():
         ious = per_class_iou(gt, pred, ncls)
         ranked = sorted(ious.items(), key=lambda kv: kv[1], reverse=True)
         chosen = ranked[:args.n_best] + ranked[-args.n_worst:]
-        summary[label] = {tnames[c - 1]: v for c, v in ranked}
+        summary[label] = {"iou": {tnames[c - 1]: v for c, v in ranked}}
         n = len(chosen)
-        fig = plt.figure(figsize=(4.1 * n, 4.6))
+        has_region = region is not None and (region >= 0).any()
+        rows = 2 if has_region else 1
+        fig = plt.figure(figsize=(4.1 * n, 4.6 * rows))
+        region_counts = {}
         for j, (c, iou) in enumerate(chosen):
-            ax = fig.add_subplot(1, n, j + 1, projection="3d")
+            ax = fig.add_subplot(rows, n, j + 1, projection="3d")
             tag = "BEST" if j < args.n_best else "WORST"
             render_panel(ax, pts, gt, pred, c, f"[{tag}] {tnames[c-1]}", iou)
             if j == 0:
                 ax.legend(loc="upper left", fontsize=7, markerscale=8, framealpha=0.85)
+            if has_region:
+                ax2 = fig.add_subplot(rows, n, n + j + 1, projection="3d")
+                region_counts[tnames[c-1]] = render_region_panel(
+                    ax2, pts, region, pred == c, f"regions of predicted '{tnames[c-1]}'")
         fig.suptitle(f"{label}  --  {args.scene}, {cs}\n"
                      f"green = correct, red = predicted here but wrong, blue = missed",
                      fontsize=10)
@@ -176,6 +222,9 @@ def main():
         out = f"{args.outdir}/{args.scene}_{cs}_{safe}.png"
         fig.savefig(out, dpi=165, bbox_inches="tight")
         plt.close(fig)
+        if has_region:
+            summary[label]["regions_per_predicted_class"] = region_counts
+            print(f"    regions covering each shown class: {region_counts}", flush=True)
         print(f"wrote {out}", flush=True)
 
     with open(f"{args.outdir}/{args.scene}_{cs}_per_class_iou.json", "w") as f:

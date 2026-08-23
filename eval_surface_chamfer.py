@@ -120,6 +120,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--scene", default="scene0000_00")
     p.add_argument("--variant", default="nonfrozen")
+    p.add_argument("--ckpt-dir", default=None,
+                   help="explicit checkpoint dir, bypassing the variant convention")
     p.add_argument("--gt-root", default=r"D:\Downloads\scannet_pointcept")
     p.add_argument("--voxel", type=float, default=0.02, help="TSDF voxel size (m)")
     p.add_argument("--sdf-trunc", type=float, default=0.08, help="TSDF truncation (m)")
@@ -143,7 +145,7 @@ def main():
 
     device = "cuda"
     scene = args.scene
-    ckpt_dir = f"output/scannet_{scene}_{args.variant}"
+    ckpt_dir = args.ckpt_dir or f"output/scannet_{scene}_{args.variant}"
 
     wp.init()
     parser = configargparse.ArgParser()
