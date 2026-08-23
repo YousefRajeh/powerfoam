@@ -36,7 +36,16 @@ Objective and gradient, using only machinery that already exists:
 
 `A^T b` is the streaming `numerator` and `A^T A` is the cached view-by-view matvec from
 solve_coupled_ridge -- the dense observation matrix b (~138 TB/scene) is never needed. Steps use
-exact line search, valid because the objective is quadratic in a, then clamp at zero.
+FISTA with a power-iteration step size, because the basis vectors within a cell are views of the
+SAME cell (measured view consistency ~0.78-0.82 cosine) and the resulting ill-conditioning made
+plain projected gradient crawl -- a slow optimizer would manufacture a FALSE NEGATIVE.
+
+The basis is AUGMENTED with the incumbent diagonal answer itself, and the solve STARTS there.
+Without that the top-K truncation alone (K~6 of a median ~12 observations) put the start at
+relative residual 0.0698 against the diagonal's 0.0503, so a null result could not distinguish
+"the constraint does not help" from "the basis was too small". With it the cone provably contains
+the incumbent, the constrained optimum is no worse than the diagonal answer by construction, and
+any improvement is attributable to the COUPLING.
 
 WHY THIS IS A POWER-DIAGRAM MOVE
 
@@ -48,7 +57,8 @@ embeddings -- there is no clean cone to constrain to. The constraint is only wel
 the partition makes per-(cell, view) observations on-manifold in the first place, which the
 mask-purity measurement independently confirmed (median purity exactly 1.0000).
 
-KILL CRITERION: if this does not beat the diagonal baseline (36.12 on scene0347_00), the whole
+KILL CRITERION: if this does not beat the diagonal baseline (36.376 on scene0347_00 under the
+now-deterministic eval), the whole
 "solve the coupling" direction is closed -- unconstrained loses, constrained loses, and the
 diagonal stands as the right answer rather than a convenient one.
 """
@@ -158,42 +168,39 @@ def main():
     valid = support > 0
     zero_lam = torch.zeros(P, device=device)
 
-    def f_of_init(c, Ub):
-        return torch.einsum("pk,pkd->pd", c, Ub)
-
-    # ---- the incumbent diagonal solution, and its projection onto the cone ----------
+    # ---- the incumbent: the diagonal answer everyone else uses ----------------------
     x_diag = torch.zeros(P, D, device=device)
     x_diag[valid] = Atb[valid] / support[valid][:, None]
-    # ---- initialize at the LEAST-SQUARES projection of the diagonal answer onto the cone ----
-    # Not the naive inner products <u_k, x>: the basis vectors u_jk are observations of the same
-    # cell from different views, so they are strongly correlated (measured view consistency
-    # ~0.78-0.82 cosine) and nowhere near orthonormal. Using inner products as coefficients
-    # therefore counts the shared direction once per view and inflates ||f|| by roughly a factor
-    # of K. Measured consequence when it was done that way: projected gradient started at
-    # relative residual 1.94 versus 0.050 for the diagonal answer itself, and after 20 iterations
-    # had only reached 0.285 -- the optimizer was spending its whole budget undoing the
-    # initialization rather than improving on the incumbent.
+
+    # ---- AUGMENT the cone basis with the incumbent itself ---------------------------
+    # Without this the comparison is confounded. Each cell's basis holds only its top-K
+    # observed views (K ~ 6), but the diagonal answer is built from ALL of that cell's
+    # observations (median ~12). So the truncated cone cannot even REPRESENT the incumbent:
+    # measured, the least-squares projection of x_diag onto the top-6 basis had relative
+    # residual 0.0698 against the diagonal's own 0.0503. The optimizer would have had to claw
+    # back that deficit before showing any gain, and a null result would then be ambiguous --
+    # was it the non-negativity constraint, or just a missing basis vector?
     #
-    # The correct projection solves the small normal equations per cell,
-    #     G_j a_j = U_j x_j,   G_j = U_j U_j^T   (K x K, K ~ 6)
-    # batched over all cells, then clamps at zero. Unobserved slots are pinned to a_k = 0 by
-    # setting their diagonal to 1 with a zero right-hand side, which keeps G invertible without
-    # perturbing the observed block.
-    have = top_w > 0
-    G = torch.einsum("pkd,pld->pkl", U, U)
-    rhs = torch.einsum("pkd,pd->pk", U, x_diag)
-    eye = torch.eye(K, device=device).expand(P, K, K)
-    missing = ~have
-    G = torch.where(missing[:, :, None] | missing[:, None, :], eye, G)
-    G = G + 1e-4 * eye                      # ridge for the correlated-basis case
-    rhs = rhs * have.float()
-    coef = torch.linalg.solve(G, rhs.unsqueeze(-1)).squeeze(-1)
-    coef = coef.clamp_min(0.0) * have.float()
-    with torch.no_grad():
-        r0 = float((op.AtA(f_of_init(coef, U), zero_lam) - Atb).norm() / Atb.norm())
-        rd = float((op.AtA(x_diag, zero_lam) - Atb).norm() / Atb.norm())
-    print(f"[init] relative residual: cone-projected diagonal {r0:.6f}  vs  diagonal {rd:.6f}",
-          flush=True)
+    # Adding normalize(x_diag) as one extra basis direction removes the ambiguity entirely.
+    # The cone now provably CONTAINS the incumbent (coefficient ||x_diag|| on that direction
+    # alone reproduces it exactly, and that coefficient is >= 0), so the constrained optimum is
+    # guaranteed no worse than the diagonal answer and any improvement is attributable to the
+    # COUPLING rather than to basis capacity. Note this keeps the cone honest: x_diag is itself
+    # a non-negative combination of observed CLIP embeddings, so the augmented cone is still
+    # spanned entirely by on-manifold directions.
+    Kt = K + 1
+    U_aug = torch.zeros(P, Kt, D, device=device)
+    U_aug[:, :K] = U
+    dn = x_diag.norm(dim=-1)
+    hasd = dn > 0
+    U_aug[hasd, K] = x_diag[hasd] / dn[hasd, None]
+    have = torch.zeros(P, Kt, dtype=torch.bool, device=device)
+    have[:, :K] = top_w > 0
+    have[:, K] = hasd
+    del U
+    U = U_aug
+    K = Kt
+    torch.cuda.empty_cache()
 
     def f_of(c):
         return torch.einsum("pk,pkd->pd", c, U)
@@ -201,6 +208,15 @@ def main():
     def grad_a(c):
         g_f = op.AtA(f_of(c), zero_lam) - Atb
         return torch.einsum("pkd,pd->pk", U, g_f), g_f
+
+    # start EXACTLY at the incumbent: all weight on the augmented direction
+    coef = torch.zeros(P, K, device=device)
+    coef[:, K - 1] = dn
+    with torch.no_grad():
+        r0 = float((op.AtA(f_of(coef), zero_lam) - Atb).norm() / Atb.norm())
+        rd = float((op.AtA(x_diag, zero_lam) - Atb).norm() / Atb.norm())
+    print(f"[init] relative residual: start {r0:.6f}  vs  diagonal {rd:.6f}  "
+          f"(must match -- the start IS the incumbent)", flush=True)
 
     # ---- FISTA (accelerated projected gradient) ------------------------------------
     # Plain projected gradient is first-order with a linear rate, and on this problem the basis
