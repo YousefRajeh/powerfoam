@@ -180,6 +180,31 @@ def build(a_args, device="cuda"):
     return {kk: (vv.to(device) if torch.is_tensor(vv) else vv) for kk, vv in cache.items()}
 
 
+
+def _proj(U, X, chunk=200_000):
+    """(P,K,D) fp16 basis times (P,D) fp32 vector -> (P,K), upcasting chunk-wise.
+
+    The basis is fp16 because at 1.1M cells an fp32 (P,7,512) tensor is 16 GB. Casting the whole
+    thing to fp32 for an einsum would defeat that, so the cast happens per chunk.
+    """
+    P, K = U.shape[0], U.shape[1]
+    out = torch.empty(P, K, device=U.device, dtype=torch.float32)
+    for s in range(0, P, chunk):
+        e = min(s + chunk, P)
+        out[s:e] = torch.einsum("pkd,pd->pk", U[s:e].float(), X[s:e])
+    return out
+
+
+def _expand(U, C, chunk=200_000):
+    """(P,K) coefficients times (P,K,D) fp16 basis -> (P,D) fp32, upcasting chunk-wise."""
+    P, D_ = U.shape[0], U.shape[2]
+    out = torch.empty(P, D_, device=U.device, dtype=torch.float32)
+    for s in range(0, P, chunk):
+        e = min(s + chunk, P)
+        out[s:e] = torch.einsum("pk,pkd->pd", C[s:e], U[s:e].float())
+    return out
+
+
 def prepare(cache, topk, device="cuda", max_edges=60_000_000):
     """Turn a cached accumulation into the solver inputs for a GIVEN topk.
 
@@ -226,7 +251,7 @@ def prepare(cache, topk, device="cuda", max_edges=60_000_000):
     Hb = build_blocks(kk, vv, U, P, Kt)
     print(f"[prepare] topk={topk} blocks {Hb.bytes()/2**30:.2f} GiB in {time.time()-t1:.0f}s",
           flush=True)
-    c = torch.einsum("pkd,pd->pk", U, Atb)
+    c = _proj(U, Atb)
     return Hb, c, U, have, dn, valid, x_diag, P, Kt
 
 
@@ -340,7 +365,7 @@ def main():
             print(f"[fista] iter {it:4d}  obj {obj(coef):.6e}  KKT {kkt(coef, gg):.6e}  "
                   f"restarts {n_restarts}  stat {restart_stat:+.3e}  ({time.time()-t0:.1f}s)", flush=True)
 
-    f = torch.einsum("pk,pkd->pd", coef, U)
+    f = _expand(U, coef)
 
     # ---- change 4: never lose a cell the incumbent could label ----------------------
     # With a >= 0 the optimizer can drive EVERY coefficient of a cell to zero -- that is the
