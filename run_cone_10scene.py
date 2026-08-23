@@ -51,10 +51,15 @@ def solve(scene, iters, force=False):
            "--config", f"output/scannet_{scene}_nonfrozen/config.yaml",
            "--feature-folder", f"artifacts/scannet/{scene}/openclip_features_sam",
            "--output", cone, "--sam-level", "3", "--iters", str(iters),
-           "--precond", "1", "--fallback", "1", "--save-diagonal", diag]
+           "--precond", "1", "--fallback", "1", "--save-diagonal", diag,
+           # K=6 from the sweep: the median cell activates only 2-3 basis directions whether
+           # offered 3 or 13, so larger K buys nothing and costs quadratically -- K=12 OOM'd on
+           # scene0070_00 (64.4M edges x 13^2 blocks ~ 43 GB).
+           "--topk", "6", "--kmax", "6", "--merge-limit", "20000000", "--max-edges", "60000000"]
     t0 = time.time()
+    env = dict(os.environ, PYTORCH_ALLOC_CONF="expandable_segments:True")
     with open(f"logs_cone10_{scene}.log", "w") as f:
-        rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT)
+        rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
     if rc != 0 or not os.path.exists(cone):
         print(f"  [{scene}] SOLVE FAILED rc={rc}, see logs_cone10_{scene}.log", flush=True)
         return None, None
