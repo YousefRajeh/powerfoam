@@ -158,13 +158,42 @@ def main():
     valid = support > 0
     zero_lam = torch.zeros(P, device=device)
 
+    def f_of_init(c, Ub):
+        return torch.einsum("pk,pkd->pd", c, Ub)
+
     # ---- the incumbent diagonal solution, and its projection onto the cone ----------
     x_diag = torch.zeros(P, D, device=device)
     x_diag[valid] = Atb[valid] / support[valid][:, None]
-    # initialize a with the cone coefficients of the diagonal answer (clamped >= 0)
-    coef = torch.einsum("pkd,pd->pk", U, x_diag).clamp_min(0.0)
+    # ---- initialize at the LEAST-SQUARES projection of the diagonal answer onto the cone ----
+    # Not the naive inner products <u_k, x>: the basis vectors u_jk are observations of the same
+    # cell from different views, so they are strongly correlated (measured view consistency
+    # ~0.78-0.82 cosine) and nowhere near orthonormal. Using inner products as coefficients
+    # therefore counts the shared direction once per view and inflates ||f|| by roughly a factor
+    # of K. Measured consequence when it was done that way: projected gradient started at
+    # relative residual 1.94 versus 0.050 for the diagonal answer itself, and after 20 iterations
+    # had only reached 0.285 -- the optimizer was spending its whole budget undoing the
+    # initialization rather than improving on the incumbent.
+    #
+    # The correct projection solves the small normal equations per cell,
+    #     G_j a_j = U_j x_j,   G_j = U_j U_j^T   (K x K, K ~ 6)
+    # batched over all cells, then clamps at zero. Unobserved slots are pinned to a_k = 0 by
+    # setting their diagonal to 1 with a zero right-hand side, which keeps G invertible without
+    # perturbing the observed block.
     have = top_w > 0
-    coef = coef * have.float()
+    G = torch.einsum("pkd,pld->pkl", U, U)
+    rhs = torch.einsum("pkd,pd->pk", U, x_diag)
+    eye = torch.eye(K, device=device).expand(P, K, K)
+    missing = ~have
+    G = torch.where(missing[:, :, None] | missing[:, None, :], eye, G)
+    G = G + 1e-4 * eye                      # ridge for the correlated-basis case
+    rhs = rhs * have.float()
+    coef = torch.linalg.solve(G, rhs.unsqueeze(-1)).squeeze(-1)
+    coef = coef.clamp_min(0.0) * have.float()
+    with torch.no_grad():
+        r0 = float((op.AtA(f_of_init(coef, U), zero_lam) - Atb).norm() / Atb.norm())
+        rd = float((op.AtA(x_diag, zero_lam) - Atb).norm() / Atb.norm())
+    print(f"[init] relative residual: cone-projected diagonal {r0:.6f}  vs  diagonal {rd:.6f}",
+          flush=True)
 
     def f_of(c):
         return torch.einsum("pk,pkd->pd", c, U)
@@ -173,30 +202,49 @@ def main():
         g_f = op.AtA(f_of(c), zero_lam) - Atb
         return torch.einsum("pkd,pd->pk", U, g_f), g_f
 
-    print("[pg] projected gradient with exact line search (objective is quadratic in a)",
-          flush=True)
+    # ---- FISTA (accelerated projected gradient) ------------------------------------
+    # Plain projected gradient is first-order with a linear rate, and on this problem the basis
+    # vectors within a cell are strongly correlated (view consistency ~0.78-0.82), so the
+    # reduced Hessian is ill-conditioned and steepest descent crawls: 20 iterations only took
+    # the residual from 1.94 to 0.285. FISTA costs one extra stored iterate and gets an O(1/k^2)
+    # rate, which matters here because a slow optimizer would produce a FALSE NEGATIVE -- we
+    # would conclude the constrained solve does not beat the diagonal when it simply had not
+    # converged.
+    #
+    # FISTA needs a fixed step 1/L rather than a line search, so L (the top eigenvalue of the
+    # reduced Hessian a -> U^T A^T A U a) is estimated by power iteration first.
+    gen = torch.Generator(device=device).manual_seed(0)
+    v = torch.randn(P, K, device=device, generator=gen) * have.float()
+    v = v / v.norm().clamp_min(1e-12)
+    L = 1.0
+    for _ in range(8):
+        Hv = torch.einsum("pkd,pd->pk", U, op.AtA(f_of(v), zero_lam)) * have.float()
+        L = float(Hv.norm())
+        v = Hv / max(L, 1e-12)
+    eta = 1.0 / max(L, 1e-12)
+    print(f"[fista] Lipschitz estimate L={L:.4e}, step eta={eta:.4e}", flush=True)
+
+    y = coef.clone()
+    t = 1.0
+    best = (r0, coef.clone())
     for it in range(a.iters):
-        g, _ = grad_a(coef)
+        g, _ = grad_a(y)
         g = g * have.float()
-        # only descend on free coordinates: at a=0 a positive gradient would push negative
-        active = (coef > 0) | (g < 0)
-        g = g * active.float()
-        gn = float(g.norm())
-        if gn == 0.0:
-            print(f"[pg] iter {it}: zero gradient, stopping", flush=True)
-            break
-        d_f = f_of(g)
-        Hd = op.AtA(d_f, zero_lam)
-        denom = float((d_f * Hd).sum())
-        if denom <= 0:
-            print(f"[pg] iter {it}: non-positive curvature, stopping", flush=True)
-            break
-        eta = float((g * g).sum()) / denom
-        coef = (coef - eta * g).clamp_min(0.0) * have.float()
-        if it % 10 == 0:
-            fj = f_of(coef)
-            res = float((op.AtA(fj, zero_lam) - Atb).norm() / Atb.norm())
-            print(f"[pg] iter {it:3d}  |grad|={gn:.4e}  relative residual={res:.6f}", flush=True)
+        coef_new = (y - eta * g).clamp_min(0.0) * have.float()
+        t_new = 0.5 * (1.0 + (1.0 + 4.0 * t * t) ** 0.5)
+        y = coef_new + ((t - 1.0) / t_new) * (coef_new - coef)
+        y = y.clamp_min(0.0) * have.float()      # keep the extrapolated point feasible too
+        coef, t = coef_new, t_new
+        if it % 10 == 0 or it == a.iters - 1:
+            res = float((op.AtA(f_of(coef), zero_lam) - Atb).norm() / Atb.norm())
+            if res < best[0]:
+                best = (res, coef.clone())
+            print(f"[fista] iter {it:3d}  |grad|={float(g.norm()):.4e}  "
+                  f"relative residual={res:.6f}", flush=True)
+    # FISTA is not monotone, so keep the best iterate actually seen rather than the last
+    if best[0] < float((op.AtA(f_of(coef), zero_lam) - Atb).norm() / Atb.norm()):
+        print(f"[fista] keeping best iterate (residual {best[0]:.6f})", flush=True)
+        coef = best[1]
 
     x = f_of(coef)
     nz = valid & (x.norm(dim=-1) > 0)

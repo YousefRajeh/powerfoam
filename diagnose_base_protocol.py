@@ -31,6 +31,7 @@ import sys
 sys.path.insert(0, r"D:\Downloads\feature-foam-lifting\src")
 sys.path.insert(0, r"D:\Downloads\powerfoam")
 
+from determinism import enable_determinism
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -69,6 +70,7 @@ def group_purity_and_oracle(groups_per_point, gt, n_groups, n_classes):
 
 
 def main():
+    enable_determinism()   # bitwise-reproducible eval; see determinism.py
     p = argparse.ArgumentParser()
     p.add_argument("--scene", default="scene0347_00")
     p.add_argument("--variant", default="nonfrozen")

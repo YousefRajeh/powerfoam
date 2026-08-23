@@ -54,6 +54,7 @@ import time
 sys.path.insert(0, r"D:\Downloads\feature-foam-lifting\src")
 sys.path.insert(0, r"D:\Downloads\powerfoam")
 
+from determinism import enable_determinism
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -189,6 +190,7 @@ def fmt_watch(res, cs="opengaussian19"):
 
 
 def main():
+    enable_determinism()   # bitwise-reproducible eval; see determinism.py
     p = argparse.ArgumentParser()
     # hardest first by measured base-protocol mIoU
     p.add_argument("--scenes", default="scene0140_00,scene0645_00,scene0070_00,scene0347_00")

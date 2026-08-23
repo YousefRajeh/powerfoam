@@ -14,6 +14,7 @@ import argparse
 import json
 from pathlib import Path
 
+from determinism import enable_determinism
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -268,6 +269,7 @@ def load_scannet_pointcept_gt(scene_dir, label_field="segment20"):
 
 
 def main(args):
+    enable_determinism()   # bitwise-reproducible eval; see determinism.py
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if args.gt_format == "scannet":

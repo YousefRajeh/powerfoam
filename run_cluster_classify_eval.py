@@ -22,6 +22,7 @@ import sys
 sys.path.insert(0, r"D:\Downloads\feature-foam-lifting\src")
 sys.path.insert(0, r"D:\Downloads\powerfoam")
 
+from determinism import enable_determinism
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -112,6 +113,7 @@ def pool_classify_broadcast(labels, unit_feats, num_labels, text_feats, weights=
 
 
 def main():
+    enable_determinism()   # bitwise-reproducible eval; see determinism.py
     device = "cuda"
     results = {m: {cs: {} for cs in CLASS_SETS} for m in ("feat_kmeans320", "pos_aware_64x5")}
 

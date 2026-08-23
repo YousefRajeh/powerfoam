@@ -44,6 +44,7 @@ from pathlib import Path
 sys.path.insert(0, r"D:\Downloads\feature-foam-lifting\src")
 sys.path.insert(0, r"D:\Downloads\powerfoam")
 
+from determinism import enable_determinism
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -63,6 +64,7 @@ from accumulate_feature_stats_sam import load_image_feature_from_SAMOpenCLIP
 
 
 def main():
+    enable_determinism()   # bitwise-reproducible eval; see determinism.py
     p = argparse.ArgumentParser()
     p.add_argument("--scene", default="scene0347_00")
     p.add_argument("--variant", default="nonfrozen")
