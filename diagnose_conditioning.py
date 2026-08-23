@@ -107,10 +107,20 @@ def main():
     # materially, and this diagnostic is about the RATIO of the two bounds
     lam = torch.zeros(P, device=device)
     CH = 100_000
+    # Power iteration rather than eigvalsh: batched cusolver syevj fails here
+    # (CUSOLVER_STATUS_INVALID_VALUE) because unobserved cells have an all-zero basis and hence a
+    # zero Gram matrix. Power iteration handles that degenerate block gracefully -- it just stays
+    # at zero -- and 10 steps is ample for a 7x7 whose spectrum is dominated by one direction.
     for s in range(0, P, CH):
         e = min(s + CH, P)
         Gm = torch.bmm(Ufull[s:e], Ufull[s:e].transpose(1, 2))
-        lam[s:e] = torch.linalg.eigvalsh(Gm)[:, -1]
+        v = torch.ones(Gm.shape[0], Gm.shape[1], 1, device=Gm.device)
+        v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+        for _ in range(10):
+            w = torch.bmm(Gm, v)
+            n = w.norm(dim=1, keepdim=True)
+            v = w / n.clamp_min(1e-30)
+        lam[s:e] = torch.bmm(v.transpose(1, 2), torch.bmm(Gm, v)).squeeze(-1).squeeze(-1)
     L_sqs = d * lam
     print(f"\nper-cell Lipschitz bounds")
     print(f"  lambda_max(U_j U_j^T): median {float(lam[alive].median()):.3f} of K={K} "
