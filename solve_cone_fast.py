@@ -159,6 +159,11 @@ def main():
     p.add_argument("--max-views", type=int, default=None)
     p.add_argument("--restart", type=int, default=1,
                    help="1 = adaptive gradient restart (default), 0 = plain FISTA, for A/B")
+    p.add_argument("--save-diagonal", default=None,
+                   help="also write the diagonal baseline from the SAME accumulation, "
+                        "so the two arms cannot drift apart")
+    p.add_argument("--fallback", type=int, default=1,
+                   help="1 = zeroed cells fall back to the diagonal (default), 0 = leave them empty")
     p.add_argument("--precond", type=int, default=1,
                    help="1 = per-cell diagonal preconditioning (default), 0 = single global step")
     a = p.parse_args()
@@ -246,6 +251,22 @@ def main():
                   f"restarts {n_restarts}  stat {restart_stat:+.3e}  ({time.time()-t0:.1f}s)", flush=True)
 
     f = torch.einsum("pk,pkd->pd", coef, U)
+
+    # ---- change 4: never lose a cell the incumbent could label ----------------------
+    # With a >= 0 the optimizer can drive EVERY coefficient of a cell to zero -- that is the
+    # least-squares answer when the cell's observations conflict, since contributing nothing
+    # beats contributing something wrong. But a zeroed cell has no feature at all and predicts
+    # nothing, and this campaign has already measured once (surface truncation, -2.74 mIoU at
+    # 90.2%->70.1% coverage) that losing coverage costs more than the contamination it removes.
+    # Measured here: 23,802 cells zeroed, an 11.7% coverage loss versus the diagonal.
+    # Cells the cone zeroed fall back to the diagonal answer, which is itself a non-negative
+    # combination of the same observed embeddings -- so the fallback stays inside the cone and
+    # the manifold guarantee is untouched.
+    if a.fallback:
+        dead = valid & (f.norm(dim=-1) <= 1e-12) & (x_diag.norm(dim=-1) > 0)
+        f[dead] = x_diag[dead]
+        print(f"[fallback] {int(dead.sum()):,} zeroed cells restored to the diagonal answer "
+              f"({float(dead.sum())/max(int(valid.sum()),1)*100:.2f}% of valid)", flush=True)
     nz = valid & (f.norm(dim=-1) > 0)
     cos = F.cosine_similarity(F.normalize(f[nz], dim=-1), F.normalize(x_diag[nz], dim=-1), dim=-1)
     print(f"[compare] cosine(cone, diagonal): median {float(cos.median()):.4f}  "
@@ -253,6 +274,11 @@ def main():
     print(f"[cone] active basis vectors per cell (median): "
           f"{float((coef > 1e-8).sum(1)[nz].float().median()):.1f} of {K}", flush=True)
     torch.save({"primitive_features": f.cpu(), "valid_mask": nz.cpu()}, a.output)
+    if a.save_diagonal:
+        dnz = valid & (x_diag.norm(dim=-1) > 0)
+        torch.save({"primitive_features": x_diag.cpu(), "valid_mask": dnz.cpu()}, a.save_diagonal)
+        print(f"[solve_cone_fast] diagonal baseline ({int(dnz.sum())}/{P} valid) -> "
+              f"{a.save_diagonal}", flush=True)
     print(f"[solve_cone_fast] {int(nz.sum())}/{P} valid -> {a.output}", flush=True)
 
 
