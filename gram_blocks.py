@@ -229,8 +229,8 @@ def build_blocks(keys, svals, U, P, K, edge_chunk=200_000):
     B = torch.empty(E, K, K, device=U.device, dtype=torch.float32)
     for s in range(0, E, edge_chunk):
         e = min(s + edge_chunk, E)
-        Uj = U[j[s:e]]                       # (chunk, K, D)
-        Ul = U[l[s:e]]
+        Uj = U[j[s:e]].float()               # (chunk, K, D); U may be fp16 to fit
+        Ul = U[l[s:e]].float()
         B[s:e] = torch.einsum("ekd,eld->ekl", Uj, Ul) * svals[s:e, None, None]
         del Uj, Ul
     return BlockSparseHessian(j, l, B, P, K)

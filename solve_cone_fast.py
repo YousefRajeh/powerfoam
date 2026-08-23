@@ -195,17 +195,26 @@ def prepare(cache, topk, device="cuda", max_edges=60_000_000):
     top_w = cache["top_w"][:, :topk].float()
     U = cache["U"][:, :topk].float()
 
+    # prune first: on the large scenes the full edge set is hundreds of millions of entries and
+    # holding it alongside the basis is what blows the budget
+    kk, vv, _ = prune_edges(cache["S_keys"], cache["S_vals"].float(), P, max_edges)
+    torch.cuda.empty_cache()
+
     valid = support > 0
     x_diag = torch.zeros(P, D, device=device)
     x_diag[valid] = Atb[valid] / support[valid][:, None]
 
     # augment the cone with the incumbent so the feasible set provably contains it
     Kt = topk + 1
-    U_aug = torch.zeros(P, Kt, D, device=device)
+    # fp16, and this is not an optimisation but a requirement: "nonfrozen" densifies to 3x the
+    # init points, so scene0140_00 has ~1.1M CELLS (not the 373k init points I had been sizing
+    # against), making an fp32 (P, 7, 512) basis 16 GB and an instant OOM. build_blocks casts
+    # chunk-wise, so the einsum still runs in fp32.
+    U_aug = torch.zeros(P, Kt, D, device=device, dtype=torch.float16)
     U_aug[:, :topk] = U
     dn = x_diag.norm(dim=-1)
     hasd = dn > 0
-    U_aug[hasd, topk] = x_diag[hasd] / dn[hasd, None]
+    U_aug[hasd, topk] = (x_diag[hasd] / dn[hasd, None]).to(torch.float16)
     have = torch.zeros(P, Kt, dtype=torch.bool, device=device)
     have[:, :topk] = top_w > 0
     have[:, topk] = hasd
@@ -213,12 +222,6 @@ def prepare(cache, topk, device="cuda", max_edges=60_000_000):
     U = U_aug
     torch.cuda.empty_cache()
 
-    # Budget the coupling. Edge count scales with cells TIMES views, so scene0140_00 (373k
-    # cells, 215 views) reaches 330M+ edges -- 64.7 GB of blocks at K=7, versus scene0347_00's
-    # 16.2M. Measured error of the truncation on this exact operator (validate_pruning.py):
-    # half the edges -> 1.7e-05, a quarter -> 2.7e-04, a sixteenth -> 3.0e-03 relative on Ha,
-    # all far below the ~1 mIoU seed noise. Safe because S_jl is a sum of non-negative products.
-    kk, vv, _ = prune_edges(cache["S_keys"], cache["S_vals"].float(), P, max_edges)
     t1 = time.time()
     Hb = build_blocks(kk, vv, U, P, Kt)
     print(f"[prepare] topk={topk} blocks {Hb.bytes()/2**30:.2f} GiB in {time.time()-t1:.0f}s",
