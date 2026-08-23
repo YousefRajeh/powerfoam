@@ -231,6 +231,40 @@ def accumulate_feature_stats_for_views(
             out_val = hard.reshape(-1)
         elif weight_transform == "sq":
             out_val = out_val * out_val
+        elif weight_transform is not None and weight_transform.startswith("surf"):
+            # 'surf<tau>' -- occlusion truncation. The export kernel walks each ray
+            # front-to-back and keeps depositing alpha*trans into cells until
+            # transmittance falls below transmittance_threshold (1e-3, i.e. 99.9%
+            # absorbed). But a SAM mask describes the FIRST surface only, so every
+            # cell behind that surface receives a feature belonging to whatever
+            # occluded it -- the measured floor->sofa 24%/table 21% leak on ScanNet
+            # (Experiment-F), where floor cells sit behind the furniture standing on
+            # them. Note our own CD-L1 surface extraction defines the surface at
+            # MEDIAN DEPTH (tau=0.5); the feature path and the geometry path have
+            # therefore been disagreeing about where the surface is by three orders
+            # of magnitude in transmittance.
+            #
+            # Transmittance before slot k is recoverable EXACTLY from the exported
+            # weights alone -- no kernel change, no extra buffer. With w_k =
+            # alpha_k * T_k and T_{k+1} = T_k*(1-alpha_k) = T_k - w_k, and T_0 = 1,
+            # telescoping gives T_k = 1 - sum_{j<k} w_j. So an exclusive cumsum over
+            # each pixel's slots reconstructs the transmittance the kernel itself
+            # held at that slot. This relies on slots being in traversal (depth)
+            # order, which holds because ONE thread owns a pixel and its
+            # atomic_add(slot_counter, row_idx, 1) is issued sequentially as it walks
+            # the ray (verified in rasterize.py::export_operator_kernel).
+            #
+            # Unused slots hold 0 and so contribute nothing to the cumsum; keep_mask
+            # discards them downstream regardless.
+            #
+            # This is NOT the already-falsified 'top1': that collapsed each pixel onto
+            # a single cell and lost the soft volumetric weighting we measured to BEAT
+            # splat-sharp lifting. 'surf' keeps every weight in front of the surface
+            # untouched and only drops the occluded tail.
+            tau = float(weight_transform[4:]) if len(weight_transform) > 4 else 0.5
+            vmat = out_val.reshape(num_pixels, max_hits_per_pixel)
+            trans_before = 1.0 - (vmat.cumsum(dim=1) - vmat)
+            out_val = (vmat * (trans_before >= tau)).reshape(-1)
 
         cols = out_col[keep_mask].long()
         # column_map: remap primitive columns to REGION columns (N2/N3 "cluster-then-

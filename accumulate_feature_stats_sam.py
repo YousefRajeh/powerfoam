@@ -54,7 +54,24 @@ def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, h
         print(f"[accumulate_feature_stats_sam] WARNING: no SAMOpenCLIP feature for {image_stem} -- using zero feature map ({height}x{width}x512)")
         return torch.zeros(height, width, 512, device="cuda")
     features = torch.from_numpy(np.load(feature_path)).to("cuda").float()
-    segment = torch.from_numpy(np.load(segment_path)).to("cuda").to(torch.long) + 1
+    segment_raw = np.load(segment_path)
+    # Corrupt mask maps must fail LOUDLY, not silently become background. Real case found
+    # locally: scene0347_00 view 440's _s.npy held int32 bit patterns under a float32 dtype
+    # header, so its values read back as denormals (~1.3e-43) and NaN -- NaN is the float32
+    # reinterpretation of -1 (0xFFFFFFFF). `.to(torch.long)` maps NaN to INT64_MIN, which
+    # indexes far out of bounds and fires a device-side assert inside F.embedding. Because
+    # CUDA reports asserts asynchronously that surfaced as an opaque "Warp CUDA error 710"
+    # attributed to whatever synced next, with no hint of which view or file was at fault.
+    # Clamping it to background would have produced a plausible-looking run built on a
+    # silently-dropped view, so it raises instead. (The authoritative copies on the remote
+    # are clean; a local mirror had drifted.)
+    if segment_raw.dtype.kind == "f" and not np.isfinite(segment_raw).all():
+        n_bad = int((~np.isfinite(segment_raw)).sum())
+        raise ValueError(
+            f"{segment_path} is corrupt: {n_bad} non-finite mask ids (NaN/inf). This is "
+            f"typically int32 data written under a float32 dtype header. Re-fetch this "
+            f"file rather than letting the view be silently dropped.")
+    segment = torch.from_numpy(segment_raw).to("cuda").to(torch.long) + 1
     if sam_level is not None:
         if isinstance(sam_level, str):
             sam_level = [int(x) for x in sam_level.split(",")]
@@ -66,6 +83,18 @@ def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, h
         segment = segment[sam_level] if isinstance(sam_level, list) else segment[sam_level:sam_level + 1]
     zero_row = torch.zeros(1, 512, device=features.device, dtype=features.dtype)
     features_pad = torch.cat([zero_row, features], dim=0)
+    # Bounds guard for FINITE-but-out-of-range ids. Note the valid range is [0, n_masks]
+    # AFTER the +1 shift, because features_pad prepends the zero/background row -- so a
+    # level whose max id equals n_masks is legitimate, not an off-by-one. This fires only
+    # for genuine index errors, and warns rather than raising because a stray id with no
+    # embedding carries no information and gets the same treatment as background (-1 -> 0).
+    oob = (segment < 0) | (segment >= features_pad.shape[0])
+    n_oob = int(oob.sum())
+    if n_oob:
+        print(f"[accumulate_feature_stats_sam] WARNING: {image_stem}: {n_oob} pixels have "
+              f"mask ids outside [0, {features.shape[0]}] ({features.shape[0]} embeddings "
+              f"exist) -- treating as background")
+        segment = segment.masked_fill(oob, 0)
     feat_map = F.embedding(segment, features_pad).sum(dim=0)
     feat_map = feat_map / (feat_map.norm(dim=-1, keepdim=True) + 1e-6)
     return feat_map
@@ -148,9 +177,12 @@ if __name__ == "__main__":
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--images-subdir", default="images")
     p.add_argument("--feature-name-format", default=None)
-    p.add_argument("--weight-transform", choices=["top1", "sq"], default=None,
+    p.add_argument("--weight-transform", default=None,
                    help="lifting-weight reshaping: top1 = per-pixel hard assignment to "
-                        "the dominant cell (splat-style), sq = w^2 soft sharpening")
+                        "the dominant cell (splat-style), sq = w^2 soft sharpening, "
+                        "surf<tau> = drop cells behind the transmittance-tau surface "
+                        "(e.g. surf0.5 = the median-depth surface our CD-L1 extraction "
+                        "already uses); keeps soft weights in front of it")
     p.add_argument("--sam-level", type=str, default=None,
                    help="use only this SAM granularity level (3 = whole/l-level, the "
                         "OpenGaussian/NormLift convention); default sums all levels")
