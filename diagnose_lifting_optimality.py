@@ -214,35 +214,52 @@ def main():
     pvalid = pmean_den > 0
     unit_pmean = unit_mean.clone()
     unit_pmean[pvalid] = F.normalize(pmean_num[pvalid], dim=-1)
+    # compute the agreement statistic now and release the raw accumulators: on the large
+    # scenes every (P, 512) tensor is ~2GB and half a dozen are otherwise live at once
+    mean_norm_stat = float(mean_num[valid].norm(dim=-1).div(mean_den[valid]).median())
+    del mean_num, pmean_num, pmean_den
+    torch.cuda.empty_cache()
 
     # ---- structural stats: how consistent are the observed features per cell? ----
     nz = (top_w > 0)
     n_obs = nz.sum(1)
     wn = top_w / top_w.sum(1, keepdim=True).clamp_min(1e-9)
     ent = -(wn.clamp_min(1e-9).log() * wn).sum(1)
-    # pairwise cosine among a cell's observed features (how consistent the views are)
+    # pairwise cosine among a cell's observed features (how consistent the views are).
+    #
+    # CHUNKED over cells. `top_f[m2]` is a boolean-mask gather that materializes a COPY of
+    # (n_selected, K, 512) -- on the large scenes (P ~ 1M after densification) that is 10-12GB
+    # and OOM'd a 48GB card, because argmax_f/med_f/top_f/top_p are all live at the same time.
+    # This is the same (N, 512) gather trap that cost 37GB on facet edges and 30GB on the
+    # lifting gather earlier in this project; the fix is identical, and the arithmetic is
+    # unchanged since every cell's Gram matrix is independent of every other cell's.
+    CELL_CH = 100_000
     cons = torch.zeros(P, device=device)
     m2 = n_obs >= 2
-    if bool(m2.any()):
-        tf = top_f[m2]
-        G = tf @ tf.transpose(1, 2)
-        msk = nz[m2].float()
-        pair = msk[:, :, None] * msk[:, None, :]
-        eye = torch.eye(K, device=device)[None]
-        pair = pair * (1 - eye)
-        cons[m2] = (G * pair).sum((1, 2)) / pair.sum((1, 2)).clamp_min(1)
+    m2_idx = torch.where(m2)[0]
+    eye = torch.eye(K, device=device)[None]
+
+    def _gram_blocks():
+        for s in range(0, m2_idx.numel(), CELL_CH):
+            idx = m2_idx[s:s + CELL_CH]
+            tf = top_f[idx]                       # (chunk, K, D)
+            msk = nz[idx].float()
+            yield idx, tf, msk, tf @ tf.transpose(1, 2)
+
+    for idx, tf, msk, G in _gram_blocks():
+        pair = msk[:, :, None] * msk[:, None, :] * (1 - eye)
+        cons[idx] = (G * pair).sum((1, 2)) / pair.sum((1, 2)).clamp_min(1)
+        del tf, G, pair
 
     # ---- selection rules ----
     argmax_f = top_f.gather(1, top_w.argmax(1)[:, None, None].expand(P, 1, D)).squeeze(1)
     # medoid among observed: highest total similarity to the others
     med_f = argmax_f.clone()
-    if bool(m2.any()):
-        tf = top_f[m2]
-        G = tf @ tf.transpose(1, 2)
-        msk = nz[m2].float()
+    for idx, tf, msk, G in _gram_blocks():
         tot = (G * (msk[:, :, None] * msk[:, None, :])).sum(2) - 1.0
-        tot = tot.masked_fill(nz[m2] == 0, -1e9)
-        med_f[m2] = tf.gather(1, tot.argmax(1)[:, None, None].expand(tf.shape[0], 1, D)).squeeze(1)
+        tot = tot.masked_fill(nz[idx] == 0, -1e9)
+        med_f[idx] = tf.gather(1, tot.argmax(1)[:, None, None].expand(tf.shape[0], 1, D)).squeeze(1)
+        del tf, G, tot
     # select the observed view in which this cell sat most cleanly inside one SAM mask,
     # rather than the one that happened to contribute the most rendering weight
     pk = top_p.masked_fill(~nz, -1.0)
@@ -324,8 +341,7 @@ def main():
            "obs_per_cell_median": float(n_obs.float().median()),
            "weight_entropy_median": float(ent[valid].median()),
            "view_consistency_median": float(cons[m2].median()) if bool(m2.any()) else None,
-           "mean_norm_before_renorm": float(mean_num[valid].norm(dim=-1).div(
-               mean_den[valid]).median()),
+           "mean_norm_before_renorm": mean_norm_stat,
            "cell_acc_mean": mean_ok, "cell_acc_argmax_w": amax_ok,
            "cell_acc_medoid": med_ok, "cell_acc_oracle_observed": oracle_frac}
     for nm, f in (("mean (current)", unit_mean), ("argmax_w (on-manifold)", argmax_f),
