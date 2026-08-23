@@ -79,7 +79,7 @@ def accumulate_and_solve(scene, ckpt_dir, tag, sam_level="3"):
     return solved
 
 
-def evaluate(scene, ckpt_dir, solved_path, device="cuda"):
+def evaluate(scene, ckpt_dir, solved_path, device="cuda", seed=0):
     split = SCENES[scene]
     gt_points, raw_labels, all_names = load_scannet_pointcept_gt(
         rf"D:\Downloads\scannet_pointcept\{split}\{scene}", "segment20")
@@ -94,7 +94,7 @@ def evaluate(scene, ckpt_dir, solved_path, device="cuda"):
     vi = torch.from_numpy(vi_np).to(device)
     unit = F.normalize(feats[vi], dim=-1)
     positions = torch.from_numpy(centers[vi_np]).to(device).float()
-    pos_labels = two_level_position_aware(positions, unit, seed=0)
+    pos_labels = two_level_position_aware(positions, unit, seed=seed)
 
     n2i = {n: i for i, n in enumerate(all_names)}
     present = set(np.unique(raw_labels).tolist())
@@ -123,6 +123,7 @@ def main():
     # hardest first by base-protocol mIoU
     p.add_argument("--scenes", default="scene0140_00,scene0645_00,scene0070_00,scene0347_00")
     p.add_argument("--arms", default="power,voronoi")
+    p.add_argument("--seeds", default="0", help="comma-separated clustering seeds; k-means assignments near centroid boundaries are genuinely unstable, so a single seed carries ~1 mIoU of uncertainty even with determinism on")
     p.add_argument("--output", default="artifacts/scannet/voronoi_feature_eval.json")
     a = p.parse_args()
 
@@ -143,7 +144,15 @@ def main():
             solved = accumulate_and_solve(scene, ckpt, tag)
             if solved is None:
                 continue
-            r = evaluate(scene, ckpt, solved)
+            seeds = [int(x) for x in a.seeds.split(",")]
+            per_seed = [evaluate(scene, ckpt, solved, seed=sd) for sd in seeds]
+            r = per_seed[0]
+            r["per_seed"] = {str(sd): {cs: ps[cs]["mIoU"] for cs in ps if cs.startswith("openg")}
+                             for sd, ps in zip(seeds, per_seed)}
+            for cs in ("opengaussian19", "opengaussian15", "opengaussian10"):
+                vals = [ps[cs]["mIoU"] for ps in per_seed]
+                r[cs]["mIoU_mean_over_seeds"] = float(np.mean(vals))
+                r[cs]["mIoU_std_over_seeds"] = float(np.std(vals))
             results[scene][arm] = r
             print(f"    cells={r['cells']}  radius_std={r['radius_std']:.6f}  "
                   f"coverage={r['coverage_valid_cells']*100:.1f}%  "
@@ -162,9 +171,10 @@ def main():
         pw, vo = arms["power"], arms["voronoi"]
         row = [f"{scene:<16}"]
         for cs, acc in (("opengaussian19", d19), ("opengaussian15", d15), ("opengaussian10", d10)):
-            dd = (vo[cs]["mIoU"] - pw[cs]["mIoU"]) * 100
+            kk = "mIoU_mean_over_seeds" if "mIoU_mean_over_seeds" in vo[cs] else "mIoU"
+            dd = (vo[cs][kk] - pw[cs][kk]) * 100
             acc.append(dd)
-            row.append(f"{pw[cs]['mIoU']*100:6.2f}/{vo[cs]['mIoU']*100:6.2f} ({dd:+5.2f})")
+            row.append(f"{pw[cs][kk]*100:6.2f}/{vo[cs][kk]*100:6.2f} ({dd:+5.2f})")
         print("  ".join(row), flush=True)
     if d19:
         print(f"\n  mean Voronoi-minus-power: 19cls {np.mean(d19):+.2f}  "
