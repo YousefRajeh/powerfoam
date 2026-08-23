@@ -119,6 +119,27 @@ class BlockSparseHessian:
     def bytes(self):
         return self.B.numel() * 4 + self.j.numel() * 8 + self.l.numel() * 8
 
+    def row_block_norms(self):
+        """Per-cell L_j = sum_l ||B_{jl}||_2, a Gershgorin-style bound on that cell's share of
+        the Lipschitz constant.
+
+        A single global step 1/L uses the LARGEST eigenvalue over the whole problem, so every
+        cell moves at the pace of the worst-conditioned one. Here S_jj = sum_r A[r,j]^2 varies by
+        orders of magnitude between a cell seen head-on in many views and one glimpsed edge-on in
+        two, so a global step is drastically too small for most cells. Note the true diagonal of H
+        is S_jj * ||u_jk||^2 = S_jj for every k (the basis vectors are unit), so the natural
+        preconditioner is a per-CELL scalar and the non-negativity projection stays a plain clamp
+        -- no per-cell NNLS needed, unlike a full 7x7 block metric.
+        """
+        dev = self.B.device
+        rs = torch.zeros(self.P, device=dev)
+        # spectral norm <= Frobenius norm; use Frobenius as the cheap valid upper bound
+        fro = self.B.flatten(1).norm(dim=1)
+        rs.index_add_(0, self.j, fro)
+        off = ~self.diag_mask
+        rs.index_add_(0, self.l[off], fro[off])
+        return rs
+
     def matvec(self, a, chunk=8_000_000):
         """(H a)_j = sum_l B_{jl} a_l, applying each stored upper-triangle block both ways."""
         out = torch.zeros_like(a)
