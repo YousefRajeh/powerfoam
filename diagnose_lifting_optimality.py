@@ -105,8 +105,13 @@ def main():
     # per-cell top-K observed features by weight, plus running mean
     top_w = torch.zeros(P, K, device=device)
     top_f = torch.zeros(P, K, D, device=device)
+    top_p = torch.zeros(P, K, device=device)   # mask purity of each kept (cell, view)
     mean_num = torch.zeros(P, D, device=device)
     mean_den = torch.zeros(P, device=device)
+    # purity-weighted mean: same accumulation, each view's contribution scaled by how
+    # cleanly that cell sat inside ONE SAM mask in that view
+    pmean_num = torch.zeros(P, D, device=device)
+    pmean_den = torch.zeros(P, device=device)
     n_views = len(cameras) if a.max_views is None else min(a.max_views, len(cameras))
     n_used = 0
 
@@ -151,6 +156,38 @@ def main():
         mean_num += f_cell
         mean_den += w_cell
 
+        # ---- per-(cell, view) SAM mask purity -------------------------------------
+        # A cell's feature in THIS view is a weight-average over the pixels whose rays
+        # crossed it. If those pixels all lie in ONE SAM mask, the resulting vector is a
+        # single mask's CLIP embedding -- on-manifold and unambiguous. If they straddle a
+        # mask boundary it is a blend of two objects' embeddings, which is exactly the
+        # off-manifold contamination the whole lifting stage suffers from. Purity measures
+        # which case this is, per (cell, view), and it is only computable because the power
+        # diagram gives EXACT cell membership for every pixel's ray -- a Gaussian method has
+        # no disjoint ownership to bin by, so this signal has no 3DGS analogue.
+        #
+        # purity(cell) = max_m W[cell, m] / sum_{m>=1} W[cell, m], over NON-background masks.
+        # Background (id 0) is excluded from both sides: its embedding is the zero row, so it
+        # contributes nothing to the feature and counting it would reward cells that mostly
+        # saw nothing.
+        seg = np.load(feat_dir / f"{stem}_s.npy")
+        seg_l3 = torch.from_numpy(seg[3]).to(device).to(torch.long) + 1   # 0 = background
+        M = int(seg_l3.max()) + 1
+        seg_flat = seg_l3.reshape(-1)
+        mask_of_nz = seg_flat[rows]
+        fg = mask_of_nz > 0
+        Wcm = torch.zeros(P * M, device=device)
+        Wcm.index_add_(0, cols[fg] * M + mask_of_nz[fg], vals[fg])
+        Wcm = Wcm.view(P, M)
+        fg_tot = Wcm.sum(1)
+        purity = torch.zeros(P, device=device)
+        okp = fg_tot > 0
+        purity[okp] = Wcm[okp].max(1).values / fg_tot[okp]
+        del Wcm
+
+        pmean_num += f_cell * purity[:, None]
+        pmean_den += w_cell * purity
+
         # insert into the per-cell top-K by weight
         worst = top_w.argmin(dim=1)
         wv = top_w.gather(1, worst[:, None]).squeeze(1)
@@ -160,6 +197,7 @@ def main():
             slot = worst[idx]
             top_w[idx, slot] = w_cell[idx]
             top_f[idx, slot] = f_view[idx]
+            top_p[idx, slot] = purity[idx]
         if (vi_ + 1) % 20 == 0:
             print(f"  view {vi_+1}/{n_views}", flush=True)
         del out_col, out_val, fmap, f_pix
@@ -168,6 +206,14 @@ def main():
     valid = mean_den > 0
     unit_mean = torch.zeros(P, D, device=device)
     unit_mean[valid] = F.normalize(mean_num[valid], dim=-1)
+    # purity-weighted mean: identical accumulation, views scaled by mask purity. Cells that
+    # never sat cleanly inside a mask in ANY view fall back to the plain mean rather than
+    # being dropped -- the surface-truncation ablation showed that losing coverage costs far
+    # more than the contamination it removes (valid-cell coverage 90.2% -> 70.1% cost -2.74
+    # mIoU), so no rule here is allowed to shrink the observed set.
+    pvalid = pmean_den > 0
+    unit_pmean = unit_mean.clone()
+    unit_pmean[pvalid] = F.normalize(pmean_num[pvalid], dim=-1)
 
     # ---- structural stats: how consistent are the observed features per cell? ----
     nz = (top_w > 0)
@@ -197,6 +243,10 @@ def main():
         tot = (G * (msk[:, :, None] * msk[:, None, :])).sum(2) - 1.0
         tot = tot.masked_fill(nz[m2] == 0, -1e9)
         med_f[m2] = tf.gather(1, tot.argmax(1)[:, None, None].expand(tf.shape[0], 1, D)).squeeze(1)
+    # select the observed view in which this cell sat most cleanly inside one SAM mask,
+    # rather than the one that happened to contribute the most rendering weight
+    pk = top_p.masked_fill(~nz, -1.0)
+    argmax_p = top_f.gather(1, pk.argmax(1)[:, None, None].expand(P, 1, D)).squeeze(1)
 
     # ---- score each rule ----
     split = SCENES[scene]
@@ -238,6 +288,37 @@ def main():
     amax_ok = float((( (argmax_f @ text.T).argmax(-1).cpu().numpy() + 1) == cell_gt)[has_gt].mean())
     med_ok = float((( (med_f @ text.T).argmax(-1).cpu().numpy() + 1) == cell_gt)[has_gt].mean())
 
+    # ---- LABEL-SPACE voting (N3 "view quorum") --------------------------------------
+    # Every rule above aggregates in FEATURE space and classifies once at the end, so a cell
+    # whose views disagree gets a blended vector that need not lie near any real mask
+    # embedding -- CLIP's manifold is not closed under averaging (NormLift measures 33.6%
+    # semantic drift under linear interpolation). Voting classifies each view FIRST, where
+    # every vector being scored is a genuine single-view mask embedding, and only then
+    # combines -- in a discrete space where "blending" is impossible by construction.
+    # sims_all/pred_all above already hold each observed view's own classification, so the
+    # vote costs nothing beyond a scatter.
+    C = text.shape[0]
+    votes_w = torch.zeros(P, C, device=device)
+    votes_u = torch.zeros(P, C, device=device)
+    votes_p = torch.zeros(P, C, device=device)
+    pred_k = sims_all.argmax(-1)                       # (P, K) 0-based class per observed view
+    nzf = nz.float()
+    for k_ in range(K):
+        idx = pred_k[:, k_]
+        votes_w.scatter_add_(1, idx[:, None], (top_w[:, k_] * nzf[:, k_])[:, None])
+        votes_u.scatter_add_(1, idx[:, None], nzf[:, k_][:, None])
+        votes_p.scatter_add_(1, idx[:, None], (top_p[:, k_] * nzf[:, k_])[:, None])
+
+    def score_labels(cls0):
+        """Score a per-cell 0-based class assignment (not a feature)."""
+        cls = cls0.cpu().numpy()
+        pred = np.zeros(len(gt_t), dtype=np.int64)
+        pred[owned] = cls[assigned[owned]] + 1
+        _, mi, _, ma = calculate_metrics(torch.from_numpy(gt_t).long(),
+                                         torch.from_numpy(pred).long(), n_classes)
+        acc = float(((cls + 1) == cell_gt)[has_gt].mean())
+        return float(mi), float(ma), acc
+
     print(f"  views actually contributing features: {n_used}/{n_views}")
     res = {"scene": scene, "cells": int(P), "views": n_views, "views_used": n_used,
            "obs_per_cell_median": float(n_obs.float().median()),
@@ -248,10 +329,24 @@ def main():
            "cell_acc_mean": mean_ok, "cell_acc_argmax_w": amax_ok,
            "cell_acc_medoid": med_ok, "cell_acc_oracle_observed": oracle_frac}
     for nm, f in (("mean (current)", unit_mean), ("argmax_w (on-manifold)", argmax_f),
-                  ("medoid (on-manifold)", med_f)):
+                  ("medoid (on-manifold)", med_f),
+                  ("purity-weighted mean", unit_pmean),
+                  ("argmax_purity (on-manifold)", argmax_p)):
         mi, ma = score(f)
         res[f"mIoU_{nm}"] = mi
         res[f"mAcc_{nm}"] = ma
+    res["cell_acc_purity_mean"] = float(
+        (((unit_pmean @ text.T).argmax(-1).cpu().numpy() + 1) == cell_gt)[has_gt].mean())
+    res["cell_acc_argmax_purity"] = float(
+        (((argmax_p @ text.T).argmax(-1).cpu().numpy() + 1) == cell_gt)[has_gt].mean())
+    for nm, v in (("vote_weighted", votes_w), ("vote_unweighted", votes_u),
+                  ("vote_purity_weighted", votes_p)):
+        mi, ma, acc = score_labels(v.argmax(-1))
+        res[f"mIoU_{nm}"] = mi
+        res[f"mAcc_{nm}"] = ma
+        res[f"cell_acc_{nm}"] = acc
+    res["purity_median"] = float(top_p[nz].median()) if bool(nz.any()) else None
+    res["purity_frac_below_0.9"] = float((top_p[nz] < 0.9).float().mean()) if bool(nz.any()) else None
 
     print(f"\n=== {scene}: lifting optimality ===")
     print(f"  observed features per cell (median)   {res['obs_per_cell_median']:.0f} of {K}")
@@ -264,9 +359,20 @@ def main():
     print(f"    medoid of observed features         {med_ok*100:6.2f}%")
     print(f"    ORACLE over observed features       {oracle_frac*100:6.2f}%   <- ceiling for "
           f"any select-one rule")
+    print(f"    purity-weighted mean                {res['cell_acc_purity_mean']*100:6.2f}%")
+    print(f"    argmax-purity observed feature      {res['cell_acc_argmax_purity']*100:6.2f}%")
+    print(f"    vote: weight-weighted               {res['cell_acc_vote_weighted']*100:6.2f}%")
+    print(f"    vote: unweighted majority           {res['cell_acc_vote_unweighted']*100:6.2f}%")
+    print(f"    vote: purity-weighted               {res['cell_acc_vote_purity_weighted']*100:6.2f}%")
+    print(f"\n  mask purity of kept (cell,view) pairs: median {res['purity_median']:.4f}, "
+          f"{res['purity_frac_below_0.9']*100:.1f}% below 0.9")
     print(f"\n  mIoU:")
-    for nm in ("mean (current)", "argmax_w (on-manifold)", "medoid (on-manifold)"):
-        print(f"    {nm:<34} {res['mIoU_'+nm]*100:6.2f}")
+    for nm in ("mean (current)", "argmax_w (on-manifold)", "medoid (on-manifold)",
+               "purity-weighted mean", "argmax_purity (on-manifold)",
+               "vote_weighted", "vote_unweighted", "vote_purity_weighted"):
+        base = res["mIoU_mean (current)"]
+        d = "" if nm == "mean (current)" else f"   ({(res['mIoU_'+nm]-base)*100:+.2f})"
+        print(f"    {nm:<34} {res['mIoU_'+nm]*100:6.2f}{d}")
     if a.output:
         json.dump(res, open(a.output, "w"), indent=2)
         print(f"\nwrote {a.output}")
