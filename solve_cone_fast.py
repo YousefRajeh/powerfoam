@@ -21,6 +21,7 @@ objective are printed, and the objective is the one that must decrease monotonic
 correct descent method.
 """
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -33,7 +34,7 @@ from configs import Params, add_group
 from data_loader import DataHandler
 from powerfoam.scene import PowerfoamScene
 from accumulate_feature_stats_sam import load_image_feature_from_SAMOpenCLIP
-from gram_blocks import accumulate_view_pairs, merge, build_blocks
+from gram_blocks import accumulate_view_pairs, merge, maybe_merge, build_blocks
 
 D = 512
 
@@ -43,7 +44,33 @@ def kkt(a, grad):
     return float(torch.minimum(a, grad).abs().max())
 
 
+def cache_path(scene, kmax, sam_level, n_views):
+    """The key must encode EVERYTHING the cache depends on.
+
+    Keying on kmax alone was a silent-corruption bug: a truncated --max-views run wrote a cache
+    built from 25 of 54 views, and every later full run then LOADED it and reported results for a
+    quarter of the data with no warning. S, A^T b and the observations all depend on which views
+    were streamed and on the SAM level, so all three go in the key, and the stored metadata is
+    re-checked on load so a stale file fails loudly instead of substituting itself.
+    """
+    return (f"artifacts/scannet/{scene}/gram_cache_K{kmax}"
+            f"_l{str(sam_level).replace(',', '')}_v{n_views}.pt")
+
+
 def build(a_args, device="cuda"):
+    """Stream the views once, producing everything downstream needs, and cache it.
+
+    S = A^T A depends ONLY on the geometry and the rays -- not on the features, not on topk. The
+    per-view observations U depend on the features but not on the coupling. So one pass produces
+    a cache that serves every topk in a sweep: U is stored sorted by descending view weight, and
+    any K <= K_max is then a slice. That turns a topk sweep from "re-stream 215 views per K" into
+    "slice a tensor per K".
+
+    U is cached in fp16: the entries are unit-norm direction vectors, so fp16's ~3 decimal digits
+    are far below the noise in a CLIP embedding, and it halves what is otherwise the largest item
+    in the cache (372k cells x 12 x 512 x 4 bytes = 9.2 GiB at fp32).
+    """
+    kmax = a_args.kmax
     wp.init()
     parser = configargparse.ArgParser()
     add_group(parser, Params)
@@ -60,13 +87,24 @@ def build(a_args, device="cuda"):
     stems = sorted(q.stem for q in (Path(args.data_path) / args.scene / "images").iterdir())
     assert len(stems) == len(cameras)
     n_views = len(cameras) if a_args.max_views is None else min(a_args.max_views, len(cameras))
+    cp = cache_path(a_args.scene, kmax, a_args.sam_level, n_views)
+    if os.path.exists(cp) and not a_args.rebuild_cache:
+        t0 = time.time()
+        c = torch.load(cp, map_location=device, weights_only=True)
+        assert c["kmax"] == kmax and c["n_views"] == n_views and c["sam_level"] == str(a_args.sam_level),             f"stale cache {cp}: {c.get('kmax')},{c.get('n_views')},{c.get('sam_level')} != {kmax},{n_views},{a_args.sam_level}"
+        print(f"[cache] loaded {cp} ({os.path.getsize(cp)/2**30:.2f} GiB, {n_views} views, "
+              f"{time.time()-t0:.0f}s)", flush=True)
+        return c
 
-    P, K = model.points.shape[0], a_args.topk
+    P, K = model.points.shape[0], kmax
     feat_dir = Path(a_args.feature_folder)
     Atb = torch.zeros(P, D, device=device)
     support = torch.zeros(P, device=device)
     top_w = torch.zeros(P, K, device=device)
-    U = torch.zeros(P, K, D, device=device)
+    # fp16 basis: these are unit-norm DIRECTIONS, so ~3 decimal digits sits far below the
+    # noise in a CLIP embedding, and at kmax=12 the fp32 version is 5.0 GiB for 204k cells
+    # (9.2 GiB at 372k) -- the largest resident tensor in the build, and it OOM'd at fp32.
+    U = torch.zeros(P, K, D, device=device, dtype=torch.float16)
     keys, svals = [], []
     t0 = time.time()
 
@@ -108,41 +146,77 @@ def build(a_args, device="cuda"):
         if bool(better.any()):
             idx = torch.where(better)[0]
             top_w[idx, worst[idx]] = w_cell[idx]
-            U[idx, worst[idx]] = f_view[idx]
+            U[idx, worst[idx]] = f_view[idx].to(torch.float16)
 
         # S is accumulated here, and the ray triples are then DISCARDED -- unlike the
         # matrix-free solver, nothing needs them again
-        accumulate_view_pairs(cols, vals, slots_used, P, keys, svals)
-        if len(keys) > 24:
-            k, v = merge(keys, svals)
-            keys, svals = [k], [v]
-        del out_col, out_val, fmap, f_pix, rows, cols, vals, f_cell, f_view
+        del fmap, f_pix, f_cell, f_view, out_col, out_val
         torch.cuda.empty_cache()
+        accumulate_view_pairs(cols, vals, slots_used, P, keys, svals)
+        del rows, cols, vals
+        torch.cuda.empty_cache()
+        # merge on accumulated SIZE, not chunk count: chunk count does not scale with the scene
+        maybe_merge(keys, svals, limit=a_args.merge_limit)
+        if vi % 5 == 0:
+            print(f'  [mem] view {vi}: alloc {torch.cuda.memory_allocated()/2**30:.2f} GiB '
+                  f'pending {sum(x.numel() for x in keys):,}', flush=True)
 
-    k, v = merge(keys, svals)
+    maybe_merge(keys, svals, force=True)
+    k, v = keys[0], svals[0]
     print(f"[build] {n_views} views, {k.numel():,} edges, {time.time()-t0:.0f}s", flush=True)
+
+    # sort each cell's observations by DESCENDING weight so that topk is a prefix slice
+    order = top_w.argsort(dim=1, descending=True)
+    top_w = top_w.gather(1, order)
+    U = U.gather(1, order[:, :, None].expand(-1, -1, D))
+
+    cache = {"S_keys": k.cpu(), "S_vals": v.cpu(), "Atb": Atb.cpu(),
+             "support": support.cpu(), "top_w": top_w.cpu(),
+             "U": U.cpu(), "P": P, "kmax": kmax,
+             "n_views": n_views, "sam_level": str(a_args.sam_level)}
+    os.makedirs(os.path.dirname(cp), exist_ok=True)
+    torch.save(cache, cp)
+    print(f"[cache] wrote {cp} ({os.path.getsize(cp)/2**30:.2f} GiB)", flush=True)
+    return {kk: (vv.to(device) if torch.is_tensor(vv) else vv) for kk, vv in cache.items()}
+
+
+def prepare(cache, topk, device="cuda"):
+    """Turn a cached accumulation into the solver inputs for a GIVEN topk.
+
+    This is the whole point of caching: S, A^T b and the per-view observations do not depend on
+    topk, so a topk sweep re-runs only this function -- a slice and one block build -- instead of
+    re-streaming every view. U was stored sorted by descending view weight, so the top-k basis is
+    the prefix U[:, :topk].
+    """
+    P, kmax = cache["P"], cache["kmax"]
+    assert topk <= kmax, f"topk={topk} exceeds cached kmax={kmax}; rebuild the cache"
+    Atb = cache["Atb"].float()
+    support = cache["support"].float()
+    top_w = cache["top_w"][:, :topk].float()
+    U = cache["U"][:, :topk].float()
 
     valid = support > 0
     x_diag = torch.zeros(P, D, device=device)
     x_diag[valid] = Atb[valid] / support[valid][:, None]
 
     # augment the cone with the incumbent so the feasible set provably contains it
-    Kt = K + 1
+    Kt = topk + 1
     U_aug = torch.zeros(P, Kt, D, device=device)
-    U_aug[:, :K] = U
+    U_aug[:, :topk] = U
     dn = x_diag.norm(dim=-1)
     hasd = dn > 0
-    U_aug[hasd, K] = x_diag[hasd] / dn[hasd, None]
+    U_aug[hasd, topk] = x_diag[hasd] / dn[hasd, None]
     have = torch.zeros(P, Kt, dtype=torch.bool, device=device)
-    have[:, :K] = top_w > 0
-    have[:, K] = hasd
+    have[:, :topk] = top_w > 0
+    have[:, topk] = hasd
     del U
     U = U_aug
     torch.cuda.empty_cache()
 
     t1 = time.time()
-    Hb = build_blocks(k, v, U, P, Kt)
-    print(f"[build] blocks {Hb.bytes()/2**30:.2f} GiB in {time.time()-t1:.0f}s", flush=True)
+    Hb = build_blocks(cache["S_keys"], cache["S_vals"].float(), U, P, Kt)
+    print(f"[prepare] topk={topk} blocks {Hb.bytes()/2**30:.2f} GiB in {time.time()-t1:.0f}s",
+          flush=True)
     c = torch.einsum("pkd,pd->pk", U, Atb)
     return Hb, c, U, have, dn, valid, x_diag, P, Kt
 
@@ -155,6 +229,10 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--sam-level", default="3")
     p.add_argument("--topk", type=int, default=6)
+    p.add_argument("--kmax", type=int, default=12,
+                   help="observations cached per cell; topk slices this prefix")
+    p.add_argument("--rebuild-cache", action="store_true")
+    p.add_argument("--merge-limit", type=int, default=60_000_000)
     p.add_argument("--iters", type=int, default=300)
     p.add_argument("--max-views", type=int, default=None)
     p.add_argument("--restart", type=int, default=1,
@@ -169,7 +247,8 @@ def main():
     a = p.parse_args()
     device = "cuda"
 
-    Hb, c, U, have, dn, valid, x_diag, P, K = build(a, device)
+    cache = build(a, device)
+    Hb, c, U, have, dn, valid, x_diag, P, K = prepare(cache, a.topk, device)
     hf = have.float()
 
     # start exactly at the incumbent: all mass on the augmented direction

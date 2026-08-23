@@ -36,15 +36,38 @@ both B_{jl} and its transpose, with the diagonal handled once.
 """
 import torch
 
-_PAIR_BUDGET = 40_000_000     # pair-instances materialized at once; ~1 GiB of int64 keys
+_PAIR_BUDGET = 20_000_000     # pair-instances materialized at once; ~0.5 GiB of int64 keys
+_MERGE_LIMIT = 60_000_000     # coalesce once this many uncoalesced pairs have piled up
 
 
 def _coalesce(keys, vals):
-    """Sum duplicate keys. Returns sorted unique keys and summed values."""
+    """Sum duplicate keys. Returns sorted unique keys and summed values.
+
+    `torch.unique` sorts internally and needs roughly 2-3x the input in workspace, so this is the
+    memory high-water mark of the whole build. On scene0140_00 (372k cells, 215 views) letting
+    24 chunks of 40M pile up before coalescing meant ~960M keys at 8 bytes plus their values plus
+    the sort workspace, and it OOM'd at 38.9 GiB allocated. Hence the smaller chunk budget above
+    and the size-triggered merge in `maybe_merge` rather than a fixed chunk count -- the right
+    trigger is total pairs pending, which scales with the scene, not the number of chunks, which
+    does not.
+    """
     uk, inv = torch.unique(keys, return_inverse=True)
     out = torch.zeros(uk.numel(), device=vals.device, dtype=vals.dtype)
     out.index_add_(0, inv, vals)
     return uk, out
+
+
+def maybe_merge(key_store, val_store, limit=_MERGE_LIMIT, force=False):
+    """Coalesce when enough pairs have accumulated. Returns True if a merge happened."""
+    total = sum(k.numel() for k in key_store)
+    if not force and total < limit:
+        return False
+    torch.cuda.empty_cache()          # hand back the per-view scratch before the sort
+    k, v = merge(key_store, val_store)
+    key_store.clear(); val_store.clear()
+    key_store.append(k); val_store.append(v)
+    torch.cuda.empty_cache()
+    return True
 
 
 def accumulate_view_pairs(cols, vals, slots, P, key_store, val_store):

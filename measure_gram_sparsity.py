@@ -19,7 +19,7 @@ import warp as wp
 from configs import Params, add_group
 from data_loader import DataHandler
 from powerfoam.scene import PowerfoamScene
-from gram_blocks import accumulate_view_pairs, merge
+from gram_blocks import accumulate_view_pairs, merge, maybe_merge
 
 
 def main():
@@ -63,10 +63,8 @@ def main():
         total_pairs += accumulate_view_pairs(cols, vv, slots_used, P, keys, vals_s)
         del out_col, out_val, cols, vv
         # periodic merge keeps the key list from growing without bound
-        if (vi + 1) % 8 == 0 or vi == n_views - 1:
-            k, v = merge(keys, vals_s)
-            keys, vals_s = [k], [v]
-            print(f"  view {vi+1}/{n_views}: running unique edges = {k.numel():,} "
+        if maybe_merge(keys, vals_s, force=(vi == n_views - 1)):
+            print(f"  view {vi+1}/{n_views}: running unique edges = {keys[0].numel():,} "
                   f"({time.time()-t0:.0f}s)", flush=True)
         torch.cuda.empty_cache()
 
