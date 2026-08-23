@@ -1,0 +1,153 @@
+"""Solve in COEFFICIENT space: precompute the block-sparse Hessian once, then iterate cheaply.
+
+THE PROBLEM WITH THE MATRIX-FREE SOLVE
+
+The cone-constrained unknown is `a` of shape (P, K) with K ~ 7 -- seven non-negative coefficients
+per cell over its own observed CLIP embeddings. But every FISTA iteration expands it to
+f = U a in 512 dimensions, streams ~810M ray nonzeros through that, and immediately contracts
+back to 7. Measured on an A6000: the 512-dim scatter/gather costs 308 ms for ONE view, so a full
+A^T A application over 54 views x 2 passes is ~33 s and touches 3.02 TiB. The same operation in
+7 dimensions costs 7.7 ms per view, 40x cheaper. The 512-dim vectors exist only to be contracted
+away again.
+
+THE REFORMULATION
+
+Write S = A^T A (P x P, sparse: cells j and l couple only if some ray crosses BOTH). Then for
+the reduced variable,
+
+    (H a)_j = sum_l  S_{jl} * (U_j U_l^T) a_l  =  sum_l  B_{jl} a_l ,     B_{jl} = S_{jl} G_{jl}
+
+with G_{jl} = U_j U_l^T a K x K matrix. Precompute B once per edge; afterwards every iteration is
+a block-sparse matvec with K x K blocks and the 512-dim features never appear in the inner loop.
+
+WHY THIS IS A POWER-DIAGRAM MOVE. S is sparse ONLY because the cells are disjoint and a ray
+crosses ~12 of them, so coupling means adjacency or occluder/occludee. A 3DGS method has 50+
+overlapping primitives per ray, so its S is far denser and this reformulation would not be
+tractable. Whether it is tractable HERE is an empirical question about nnz(S), which is exactly
+what --measure-only answers before any of the expensive machinery is built.
+
+BUILDING S. Rows (pixels) are disjoint, so S = sum over rows of the outer product of that row's
+nonzeros. For a row with n_r entries that is n_r^2 pairs, and sum_r n_r^2 is ~1.9e8 per view at
+a median of 12 hits/pixel -- large but chunkable. Pairs are generated with the standard
+"expand ranges" trick on the row-sorted triples, coalesced per chunk, then merged.
+
+Only the LOWER-OR-EQUAL triangle is stored (j <= l) since S is symmetric; the matvec applies
+both B_{jl} and its transpose, with the diagonal handled once.
+"""
+import torch
+
+_PAIR_BUDGET = 40_000_000     # pair-instances materialized at once; ~1 GiB of int64 keys
+
+
+def _coalesce(keys, vals):
+    """Sum duplicate keys. Returns sorted unique keys and summed values."""
+    uk, inv = torch.unique(keys, return_inverse=True)
+    out = torch.zeros(uk.numel(), device=vals.device, dtype=vals.dtype)
+    out.index_add_(0, inv, vals)
+    return uk, out
+
+
+def accumulate_view_pairs(cols, vals, slots, P, key_store, val_store):
+    """Fold one view's contribution to S into the running (key, value) lists.
+
+    `cols`/`vals` are the view's compacted nonzeros in row-major (pixel) order and `slots` is the
+    per-pixel count, so the triples are already grouped by row -- which is what makes the range
+    expansion below valid without an explicit sort.
+    """
+    device = cols.device
+    slots = slots.long()
+    npix = slots.numel()
+    row_start = torch.cumsum(slots, 0) - slots            # first nonzero index of each pixel
+    n_at = torch.repeat_interleave(slots, slots)          # per-nonzero: how many entries its row has
+    start_at = torch.repeat_interleave(row_start, slots)  # per-nonzero: where its row begins
+
+    nnz = cols.numel()
+    # process nonzeros in chunks whose expanded pair count stays under the budget
+    pair_counts = n_at
+    cum = torch.cumsum(pair_counts, 0)
+    total_pairs = int(cum[-1]) if nnz else 0
+
+    s = 0
+    while s < nnz:
+        # largest e such that pairs in [s, e) <= budget
+        base = cum[s] - pair_counts[s]
+        e = int(torch.searchsorted(cum, base + _PAIR_BUDGET).item())
+        e = max(e, s + 1)
+        e = min(e, nnz)
+        n_chunk = pair_counts[s:e]
+        tot = int(n_chunk.sum())
+        # left index of each pair: the nonzero itself, repeated n_r times
+        left = torch.repeat_interleave(torch.arange(s, e, device=device), n_chunk)
+        # right index: walk the row's range [start, start+n)
+        off = torch.arange(tot, device=device) - torch.repeat_interleave(
+            torch.cumsum(n_chunk, 0) - n_chunk, n_chunk)
+        right = start_at[left] + off
+        # Emit each UNORDERED pair once. The expansion above walks the full row for every
+        # nonzero, so an off-diagonal pair appears twice -- once as (j,l) and once as (l,j) --
+        # and both collapse onto the same upper-triangle key, storing 2*S_{jl}. Since matvec
+        # then applies the block AND its transpose, the off-diagonal would be counted four
+        # times instead of twice while the diagonal stayed correct. Measured symptom before
+        # this filter: relative error 4.5e-02 against the matrix-free operator.
+        sel = right >= left
+        left, right = left[sel], right[sel]
+        cj, cl = cols[left], cols[right]
+        lo = torch.minimum(cj, cl)
+        hi = torch.maximum(cj, cl)
+        keys = lo * P + hi
+        v = vals[left] * vals[right]
+        k2, v2 = _coalesce(keys, v)
+        key_store.append(k2)
+        val_store.append(v2)
+        del left, right, off, cj, cl, lo, hi, keys, v, k2, v2
+        s = e
+    return total_pairs
+
+
+def merge(key_store, val_store):
+    k = torch.cat(key_store)
+    v = torch.cat(val_store)
+    return _coalesce(k, v)
+
+
+class BlockSparseHessian:
+    """H in coefficient space: K x K blocks on the upper triangle of S, applied symmetrically."""
+
+    def __init__(self, j_idx, l_idx, blocks, P, K):
+        self.j, self.l, self.B, self.P, self.K = j_idx, l_idx, blocks, P, K
+        self.diag_mask = j_idx == l_idx
+
+    def bytes(self):
+        return self.B.numel() * 4 + self.j.numel() * 8 + self.l.numel() * 8
+
+    def matvec(self, a, chunk=8_000_000):
+        """(H a)_j = sum_l B_{jl} a_l, applying each stored upper-triangle block both ways."""
+        out = torch.zeros_like(a)
+        E = self.j.numel()
+        for s in range(0, E, chunk):
+            e = min(s + chunk, E)
+            j, l, B = self.j[s:e], self.l[s:e], self.B[s:e]
+            # j <- B @ a_l
+            out.index_add_(0, j, torch.bmm(B, a[l].unsqueeze(-1)).squeeze(-1))
+            # l <- B^T @ a_j, skipping the diagonal so it is not counted twice
+            off = ~self.diag_mask[s:e]
+            if bool(off.any()):
+                out.index_add_(0, l[off],
+                               torch.bmm(B[off].transpose(1, 2),
+                                         a[j[off]].unsqueeze(-1)).squeeze(-1))
+        return out
+
+
+def build_blocks(keys, svals, U, P, K, edge_chunk=200_000):
+    """B_e = S_e * (U_j U_l^T). Chunked over edges: gathering U for all edges at once would be
+    (E, K, 512) which is hundreds of GB at realistic E."""
+    j = (keys // P).to(torch.int64)
+    l = (keys % P).to(torch.int64)
+    E = j.numel()
+    B = torch.empty(E, K, K, device=U.device, dtype=torch.float32)
+    for s in range(0, E, edge_chunk):
+        e = min(s + edge_chunk, E)
+        Uj = U[j[s:e]]                       # (chunk, K, D)
+        Ul = U[l[s:e]]
+        B[s:e] = torch.einsum("ekd,eld->ekl", Uj, Ul) * svals[s:e, None, None]
+        del Uj, Ul
+    return BlockSparseHessian(j, l, B, P, K)
