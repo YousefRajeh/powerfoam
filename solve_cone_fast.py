@@ -383,9 +383,22 @@ def main():
         print(f"[fallback] {int(dead.sum()):,} zeroed cells restored to the diagonal answer "
               f"({float(dead.sum())/max(int(valid.sum()),1)*100:.2f}% of valid)", flush=True)
     nz = valid & (f.norm(dim=-1) > 0)
-    cos = F.cosine_similarity(F.normalize(f[nz], dim=-1), F.normalize(x_diag[nz], dim=-1), dim=-1)
+    # CHUNKED. f[nz] is a boolean-mask gather that materialises an (n, 512) COPY, and with
+    # x_diag[nz] plus two normalize() temporaries that is ~8 GB at 1.1M cells -- which OOM'd
+    # scene0140_00 at 42.3 GiB allocated, AFTER the solve had completed, purely to compute a
+    # diagnostic that gets printed and discarded. Fourth occurrence of this (N, 512) gather trap
+    # in this project (facet edges 37GB, lifting gather 30GB, top_f[m2] 10.9GB).
+    idx = torch.where(nz)[0]
+    cos_parts = []
+    for s0 in range(0, idx.numel(), 200_000):
+        ii = idx[s0:s0 + 200_000]
+        cos_parts.append(F.cosine_similarity(F.normalize(f[ii], dim=-1),
+                                             F.normalize(x_diag[ii], dim=-1), dim=-1))
+    cos = torch.cat(cos_parts) if cos_parts else torch.zeros(1, device=f.device)
     print(f"[compare] cosine(cone, diagonal): median {float(cos.median()):.4f}  "
           f"frac<0.99 {float((cos<0.99).float().mean())*100:.2f}%", flush=True)
+    del cos_parts, cos
+    torch.cuda.empty_cache()
     print(f"[cone] active basis vectors per cell (median): "
           f"{float((coef > 1e-8).sum(1)[nz].float().median()):.1f} of {K}", flush=True)
     torch.save({"primitive_features": f.cpu(), "valid_mask": nz.cpu()}, a.output)
