@@ -181,6 +181,45 @@ class BlockSparseHessian:
         return out
 
 
+def prune_edges(keys, svals, P, max_edges, verbose=True):
+    """Keep the largest-magnitude off-diagonal couplings, always keeping the diagonal.
+
+    Edge count does not scale with cells alone -- it scales with cells TIMES view count, because
+    every additional view discovers new occluder/occludee pairs. Measured: scene0347_00 (204k
+    cells, 54 views) has 16.2M edges, but scene0140_00 (373k cells, 215 views) has 330M+, which
+    at K=7 is 64.7 GB of blocks on a 48 GB card. So the coefficient-space reformulation needs a
+    budget to be usable on the large scenes, not just the small ones.
+
+    Pruning by |S_jl| is the right truncation because S_jl = sum_r A[r,j]A[r,l] is a sum of
+    non-negative products -- there is no cancellation, so a small entry really does mean a weak
+    coupling rather than a large one that happened to cancel. That is a property of THIS matrix
+    (A >= 0) and would not hold for a general signed operator.
+
+    Diagonal entries are exempt: S_jj is the self-term the whole diagonal estimator is built on,
+    and dropping any of it would silently change the incumbent the solve starts from.
+    """
+    E = keys.numel()
+    if E <= max_edges:
+        return keys, svals, 1.0
+    j = keys // P
+    l = keys % P
+    is_diag = j == l
+    n_diag = int(is_diag.sum())
+    budget = max(max_edges - n_diag, 0)
+    off = ~is_diag
+    off_vals = svals[off]
+    if budget == 0 or off_vals.numel() <= budget:
+        return keys, svals, 1.0
+    thresh = torch.topk(off_vals, budget, largest=True, sorted=False).values.min()
+    keep = is_diag | (svals >= thresh)
+    kept_mass = float(svals[keep].sum() / svals.sum())
+    if verbose:
+        print(f"[prune] {E:,} -> {int(keep.sum()):,} edges (budget {max_edges:,}), "
+              f"retaining {kept_mass*100:.3f}% of total coupling mass, "
+              f"all {n_diag:,} diagonal entries kept", flush=True)
+    return keys[keep], svals[keep], kept_mass
+
+
 def build_blocks(keys, svals, U, P, K, edge_chunk=200_000):
     """B_e = S_e * (U_j U_l^T). Chunked over edges: gathering U for all edges at once would be
     (E, K, 512) which is hundreds of GB at realistic E."""

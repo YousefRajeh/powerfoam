@@ -34,7 +34,7 @@ from configs import Params, add_group
 from data_loader import DataHandler
 from powerfoam.scene import PowerfoamScene
 from accumulate_feature_stats_sam import load_image_feature_from_SAMOpenCLIP
-from gram_blocks import accumulate_view_pairs, merge, maybe_merge, build_blocks
+from gram_blocks import accumulate_view_pairs, merge, maybe_merge, build_blocks, prune_edges
 
 D = 512
 
@@ -180,7 +180,7 @@ def build(a_args, device="cuda"):
     return {kk: (vv.to(device) if torch.is_tensor(vv) else vv) for kk, vv in cache.items()}
 
 
-def prepare(cache, topk, device="cuda"):
+def prepare(cache, topk, device="cuda", max_edges=60_000_000):
     """Turn a cached accumulation into the solver inputs for a GIVEN topk.
 
     This is the whole point of caching: S, A^T b and the per-view observations do not depend on
@@ -213,8 +213,14 @@ def prepare(cache, topk, device="cuda"):
     U = U_aug
     torch.cuda.empty_cache()
 
+    # Budget the coupling. Edge count scales with cells TIMES views, so scene0140_00 (373k
+    # cells, 215 views) reaches 330M+ edges -- 64.7 GB of blocks at K=7, versus scene0347_00's
+    # 16.2M. Measured error of the truncation on this exact operator (validate_pruning.py):
+    # half the edges -> 1.7e-05, a quarter -> 2.7e-04, a sixteenth -> 3.0e-03 relative on Ha,
+    # all far below the ~1 mIoU seed noise. Safe because S_jl is a sum of non-negative products.
+    kk, vv, _ = prune_edges(cache["S_keys"], cache["S_vals"].float(), P, max_edges)
     t1 = time.time()
-    Hb = build_blocks(cache["S_keys"], cache["S_vals"].float(), U, P, Kt)
+    Hb = build_blocks(kk, vv, U, P, Kt)
     print(f"[prepare] topk={topk} blocks {Hb.bytes()/2**30:.2f} GiB in {time.time()-t1:.0f}s",
           flush=True)
     c = torch.einsum("pkd,pd->pk", U, Atb)
@@ -233,6 +239,8 @@ def main():
                    help="observations cached per cell; topk slices this prefix")
     p.add_argument("--rebuild-cache", action="store_true")
     p.add_argument("--merge-limit", type=int, default=60_000_000)
+    p.add_argument("--max-edges", type=int, default=60_000_000,
+                   help="coupling budget; see validate_pruning.py for the measured error")
     p.add_argument("--iters", type=int, default=300)
     p.add_argument("--max-views", type=int, default=None)
     p.add_argument("--restart", type=int, default=1,
@@ -248,7 +256,7 @@ def main():
     device = "cuda"
 
     cache = build(a, device)
-    Hb, c, U, have, dn, valid, x_diag, P, K = prepare(cache, a.topk, device)
+    Hb, c, U, have, dn, valid, x_diag, P, K = prepare(cache, a.topk, device, a.max_edges)
     hf = have.float()
 
     # start exactly at the incumbent: all mass on the augmented direction
