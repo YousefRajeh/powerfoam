@@ -150,6 +150,14 @@ class PowerfoamScene(nn.Module):
         radii = knn_d.mean(axis=1)
         radii = torch.tensor(radii, dtype=self.tscalar, device=device)
         radii = torch.minimum(radii, max_radii.to(device))
+        if getattr(self.args, "constant_radii", False):
+            # Equal radii => the -r^2 term is constant across cells => the power diagram
+            # degenerates to a Voronoi diagram. Use the MEDIAN of the kNN-derived radii so the
+            # overall cell scale matches the learned-radii run and only the per-cell variation
+            # is removed.
+            r_const = float(radii.median())
+            radii = torch.full_like(radii, r_const)
+            print(f"[constant_radii] Voronoi mode: all radii fixed at {r_const:.5f}")
         self.radii = nn.Parameter(radii)
 
         quaternions = torch.randn(
@@ -615,7 +623,9 @@ class PowerfoamScene(nn.Module):
             },
             {
                 "params": self.radii,
-                "lr": args.radii_lr_init,
+                # frozen in Voronoi mode: a learned per-cell radius is exactly what a Voronoi
+                # diagram does not have
+                "lr": 0.0 if getattr(args, "constant_radii", False) else args.radii_lr_init,
                 "name": "radii",
             },
             {
@@ -661,9 +671,12 @@ class PowerfoamScene(nn.Module):
             warmup_steps=getattr(args, "density_warmup_steps", 1_000),
             max_steps=iterations,
         )
+        # scheduler must also be zeroed, or it would overwrite the frozen group LR each step
+        _rlr_i = 0.0 if getattr(args, "constant_radii", False) else args.radii_lr_init
+        _rlr_f = 0.0 if getattr(args, "constant_radii", False) else args.radii_lr_final
         self.radii_scheduler = get_cosine_scheduler(
-            args.radii_lr_init,
-            args.radii_lr_final,
+            _rlr_i,
+            _rlr_f,
             warmup_steps=1_000,
             max_steps=iterations,
         )

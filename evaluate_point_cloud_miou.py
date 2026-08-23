@@ -75,10 +75,20 @@ def remap_gt_labels(raw_labels, target_ids):
     return remapped
 
 
-def embed_class_names(class_names, device):
+# OpenGaussian's shipped text_features.json (assets/text_features.zip) tokenizes this class
+# as ONE word, and LUDVIG loads that exact file, so every ScanNet baseline queries
+# "showercurtain". Verified by comparing embeddings: 18 of our 19 class vectors match theirs
+# to cos = 1.0000, and this one sat at 0.8621 purely because of the space. Rewriting it here
+# makes our text bank byte-identical to the baselines' rather than differing on one class.
+OPENGAUSSIAN_NAME_OVERRIDES = {"shower curtain": "showercurtain"}
+
+
+def embed_class_names(class_names, device, match_opengaussian=True):
     clip_model, _, _ = open_clip.create_model_and_transforms(CLIP_MODEL, pretrained=CLIP_PRETRAINED)
     clip_model.eval().to(device)
     tokenizer = open_clip.get_tokenizer(CLIP_MODEL)
+    if match_opengaussian:
+        class_names = [OPENGAUSSIAN_NAME_OVERRIDES.get(n, n) for n in class_names]
     with torch.no_grad():
         tok = tokenizer(class_names).to(device)
         text_feats = clip_model.encode_text(tok).float()

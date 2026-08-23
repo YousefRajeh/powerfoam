@@ -97,6 +97,22 @@ class Params:
     # equally regardless of size. Their reported symptom of the softplus bias -- "large
     # cells that should be empty settle at a low but non-zero density" -- is our
     # interior-non-owner problem. "softplus" (default) keeps the historical behaviour.
+    # VORONOI ABLATION. The power distance is ||x-c||^2 - r^2, so if every r is EQUAL the
+    # -r^2 term is constant across cells and the argmin reduces to ||x-c||^2 -- an exact
+    # Voronoi diagram, i.e. the Radiant Foam / VoroTracing representation. Setting this
+    # initializes all radii to one value and freezes them (radii lr forced to 0), which turns
+    # our power diagram into a Voronoi one WITHOUT swapping codebases.
+    #
+    # Motivation: the power weight has produced three negative results for us (radius-weighted
+    # FPS seeding -5.4 mIoU, radius-gated refinement failed at 10 scenes, distortion-to-radii
+    # made CD-L1 31% worse) and zero positive ones. Everything semantic we do -- exact cell
+    # membership, facet adjacency, ray-traversal lifting -- never reads r. This ablation asks
+    # whether r earns its place at all.
+    #
+    # CAVEAT to state wherever this is reported: radii also scale the texel-site offsets
+    # (scene.py builds `offsets = texel_sites * radii`), so constant radii also equalizes the
+    # appearance parameterization. It is not a pure partition-only ablation.
+    constant_radii: bool = False
     density_activation: str = "softplus"
     # Linear warmup on the density LR. 1000 was hardcoded historically; VoroTracing uses
     # 2000 and it is the only group they warm. Exposed so the two can be A/B'd, since the
