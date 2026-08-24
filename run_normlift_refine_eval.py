@@ -14,6 +14,13 @@ Their sensitivity analysis: all six hyperparameters vary mIoU < 2 points across 
 ranges (Appendix C), so literature-sane defaults are used here; sigma_d defaults to the
 scene's median neighbor distance.
 
+GRAPH CORRECTION (2026-08-24): "the EXACT power-diagram adjacency" above was NOT what this
+script loaded.  It hardcoded adjacency_<variant>.pt, which powerfoam/bvh.py::count_adjacent
+builds by bounding-ball overlap (a Cech complex, radius = half the AABB's X-extent), not by
+facet sharing.  The default is now --graph true_facet (adjacency_true_facet.pt, the regular
+triangulation dual to the power diagram); --graph cech reproduces the old behaviour.  See
+run_refine_graph_comparison.py for the paired 10-scene measurement of the difference.
+
 Evaluation follows THEIR protocol exactly: every primitive queried INDEPENDENTLY
 (no clustering), raw class names (byte-identical to OpenGaussian's shipped embeddings),
 plain cosine argmax.
@@ -126,6 +133,18 @@ def main():
     p.add_argument("--delta", type=float, default=0.1)
     p.add_argument("--passes", type=int, default=1)
     p.add_argument("--neighbors", choices=["adjacency", "knn30"], default="adjacency")
+    p.add_argument("--graph", choices=["true_facet", "cech"], default="true_facet",
+                   help="which stored adjacency to use when --neighbors=adjacency. "
+                        "'true_facet' = adjacency_true_facet.pt, the regular-triangulation "
+                        "dual of the power diagram (build_true_facet_graph.py) -- the ONLY "
+                        "graph whose edges are real shared facets, and now the default. "
+                        "'cech' = the historical adjacency_<variant>.pt from "
+                        "powerfoam/bvh.py::count_adjacent, which tests bounding-ball overlap "
+                        "d < r_i + r_j with r = 0.5*(max.x - min.x) -- half the AABB's "
+                        "X-EXTENT, not facet sharing. Measured on scene0347_00: 54.17% facet "
+                        "recall, 37.77% precision, 36.77% facet-AREA recall (biased against "
+                        "exactly the large facets that matter), mean degree 21.84 vs a true "
+                        "15.23. Kept only to reproduce pre-correction numbers.")
     p.add_argument("--output", default=None)
     args = p.parse_args()
 
@@ -136,7 +155,9 @@ def main():
         split = SCENES[scene]
         ckpt_dir = f"output/scannet_{scene}_{args.variant}"
         stats_path = f"artifacts/scannet/{scene}/train_stats_sam_{args.variant}{args.suffix}.pt"
-        adjacency_path = f"artifacts/scannet/{scene}/adjacency_{args.variant}.pt"
+        adjacency_path = (f"artifacts/scannet/{scene}/adjacency_true_facet.pt"
+                          if args.graph == "true_facet"
+                          else f"artifacts/scannet/{scene}/adjacency_{args.variant}.pt")
         gt_dir = f"{args.gt_root}/{split}/{scene}"
 
         stats = AccumulatedFeatureStats.load(stats_path)
@@ -155,8 +176,14 @@ def main():
         import os
         if not os.path.exists(adjacency_path):
             import subprocess
-            subprocess.run([sys.executable, "export_adjacency_graph.py", "-c",
-                            f"{ckpt_dir}/config.yaml", "--output", adjacency_path], check=True)
+            if args.graph == "true_facet":
+                subprocess.run([sys.executable, "build_true_facet_graph.py", "--scene", scene,
+                                "--variant", args.variant, "--output", adjacency_path],
+                               check=True)
+            else:
+                subprocess.run([sys.executable, "export_adjacency_graph.py", "-c",
+                                f"{ckpt_dir}/config.yaml", "--output", adjacency_path],
+                               check=True)
         adj = torch.load(adjacency_path, map_location=device, weights_only=True)
         adjacent, offsets = adj["adjacent"].to(device).long(), adj["offsets"].to(device).long()
         if args.neighbors == "knn30":

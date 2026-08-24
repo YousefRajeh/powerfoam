@@ -41,9 +41,21 @@ def load_points_radii(ckpt_dir):
     return pts.numpy().astype(np.float64), radii.numpy().astype(np.float64)
 
 
-def regular_triangulation_edges(points, radii, qhull_options=None):
-    """Unique undirected edges (i<j) of the regular triangulation of the weighted sites."""
-    w = (points ** 2).sum(axis=1) - radii ** 2
+def regular_triangulation_edges(points, radii=None, qhull_options=None):
+    """Unique undirected edges (i<j) of the regular triangulation of the weighted sites.
+
+    radii=None (or all-zero radii) is the UNWEIGHTED case: the lift becomes w_i = |x_i|^2,
+    the standard paraboloid lift, and the lower hull is the ORDINARY Delaunay triangulation,
+    dual to the ordinary Voronoi diagram.  This is exactly what radfoam needs: its foam has
+    no per-site radii (see radfoam src/delaunay/predicate.cuh, whose EmptyCircumspherePredicate
+    calls Shewchuk's unweighted insphere() on plain Vec3f, and src/tracing/tracing_utils.cuh,
+    whose cell faces are perpendicular bisectors `face_origin = p_i + (p_j - p_i)/2` with
+    `face_normal = p_j - p_i`).  The weighted case is unchanged.
+    """
+    if radii is None:
+        w = (points ** 2).sum(axis=1)
+    else:
+        w = (points ** 2).sum(axis=1) - radii ** 2
     lifted = np.concatenate([points, w[:, None]], axis=1)
     t0 = time.time()
     hull = ConvexHull(lifted) if qhull_options is None else ConvexHull(lifted, qhull_options=qhull_options)
@@ -97,6 +109,12 @@ def main():
     p.add_argument("--output", default=None)
     p.add_argument("--npz-output", default=None)
     p.add_argument("--qhull-options", default=None)
+    p.add_argument("--unweighted", action="store_true",
+                   help="ignore radii and build the ORDINARY Delaunay adjacency "
+                        "(the correct dual for an unweighted foam such as radfoam)")
+    p.add_argument("--points-npy", default=None,
+                   help="read centers from a .npy/.npz instead of a PowerFoam model.pt "
+                        "(implies --unweighted unless a radii array is present)")
     p.add_argument("--validate", action="store_true",
                    help="compare against an existing true_facet_graph.npz for this scene")
     a = p.parse_args()
@@ -105,9 +123,21 @@ def main():
     out = a.output or f"artifacts/scannet/{a.scene}/adjacency_true_facet.pt"
 
     t0 = time.time()
-    points, radii = load_points_radii(ckpt_dir)
+    if a.points_npy:
+        arr = np.load(a.points_npy)
+        points = np.asarray(arr["points"] if hasattr(arr, "files") else arr,
+                            dtype=np.float64)
+        radii = None
+        if hasattr(arr, "files") and "radii" in arr.files and not a.unweighted:
+            radii = np.asarray(arr["radii"], dtype=np.float64)
+    else:
+        points, radii = load_points_radii(ckpt_dir)
+    if a.unweighted:
+        radii = None
     P = points.shape[0]
-    print(f"[build] {a.scene}: P={P} cells  (load {time.time()-t0:.1f}s)", flush=True)
+    print(f"[build] {a.scene}: P={P} cells "
+          f"({'unweighted/Delaunay' if radii is None else 'weighted/regular'}) "
+          f"(load {time.time()-t0:.1f}s)", flush=True)
 
     edges, n_tets, t_hull = regular_triangulation_edges(points, radii, a.qhull_options)
     print(f"[build] 4D hull: {t_hull:.1f}s, lower-hull tets={n_tets}, "

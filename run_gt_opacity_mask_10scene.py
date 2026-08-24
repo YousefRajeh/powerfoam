@@ -64,6 +64,13 @@ def main():
     p.add_argument("--output", default="artifacts/scannet/gt_opacity_mask_10scene.json")
     p.add_argument("--resume", action="store_true",
                    help="Skip scenes already present in --output instead of recomputing them.")
+    p.add_argument("--variant", choices=["nonfrozen", "frozen"], default="nonfrozen",
+                   help="frozen = position-frozen, no densification, so cell i IS GT point i and "
+                        "OpenGaussian's rule applies literally by index.")
+    p.add_argument("--mask-mode", choices=["assigned", "index"], default="assigned",
+                   help="assigned: mask the point whose power cell is transparent (the only "
+                        "option off frozen). index: mask point i by cell i's alpha -- this is "
+                        "OpenGaussian's own indexing, valid ONLY under the 1:1 frozen identity.")
     a = p.parse_args()
     enable_determinism()
     device = "cuda"
@@ -79,10 +86,17 @@ def main():
         print(f"\n===== {scene} =====", flush=True)
         gt_dir = os.path.join(GT_ROOT, split, scene)
         gt_points, raw_labels, all_names = load_scannet_pointcept_gt(gt_dir, "segment20")
+        # scene0000_00's corrected position-frozen run lives under `truefrozen`; the other nine
+        # were retrained in place, so their plain `_frozen` dirs ARE the corrected ones (the
+        # position-drifting originals were preserved as `_frozen_STALE_posdrift`).
+        if a.variant == "frozen":
+            tag = "truefrozen" if scene == "scene0000_00" else "frozen"
+        else:
+            tag = "nonfrozen"
         centers, radii, density = load_foam(
-            f"output/scannet_{scene}_nonfrozen", device, return_density=True)
+            f"output/scannet_{scene}_{tag}", device, return_density=True)
 
-        solved = torch.load(f"artifacts/scannet/{scene}/solved_geometric_median_nonfrozen.pt",
+        solved = torch.load(f"artifacts/scannet/{scene}/solved_geometric_median_{tag}.pt",
                             map_location=device, weights_only=True)
         feats = solved["primitive_features"].to(device).float()
         valid_mask = solved["valid_mask"].cpu().numpy()
@@ -94,6 +108,25 @@ def main():
         flat_labels, _ = spherical_kmeans(unit, K_FLAT, seed=a.seed)
 
         rad = radii.reshape(-1)
+        if a.mask_mode == "index" and centers.shape[0] != gt_points.shape[0]:
+            raise SystemExit(
+                f"{scene}: --mask-mode index needs the 1:1 frozen identity, but there are "
+                f"{centers.shape[0]} primitives and {gt_points.shape[0]} GT points. "
+                f"OpenGaussian's own indexing is only meaningful under --frozen_init_pts.")
+
+        def low_mask(alpha):
+            """Which GT points does this alpha field delete?
+
+            index: OpenGaussian's literal rule -- point i is masked by cell i's own alpha, with no
+              assignment step at all. Only defined under the frozen 1:1 identity, guarded above.
+            assigned: the generalisation that survives densification -- mask the point whose
+              containing power cell is transparent.
+            """
+            if a.mask_mode == "index":
+                return alpha < a.threshold
+            m = np.zeros(gt_points.shape[0], dtype=bool)
+            m[owned] = alpha[assigned[owned]] < a.threshold
+            return m
         rec = {"n_points": int(gt_points.shape[0]),
                "density_pct": {q: float(np.percentile(density, q)) for q in (1, 50, 99)},
                "arms": {}}
@@ -101,8 +134,6 @@ def main():
         for Lname in lengths:
             L = rad * 2.0 if Lname == "radius2" else float(Lname)
             alpha = 1.0 - np.exp(-density * L)
-            low = np.zeros(gt_points.shape[0], dtype=bool)
-            low[owned] = alpha[assigned[owned]] < a.threshold
             rec["arms"][Lname] = {
                 "alpha_pct": {q: float(np.percentile(alpha, q)) for q in (1, 50, 99)},
                 "low_prim_pct": float((alpha < a.threshold).mean() * 100),
@@ -137,8 +168,7 @@ def main():
             for Lname in lengths:
                 L = rad * 2.0 if Lname == "radius2" else float(Lname)
                 alpha = 1.0 - np.exp(-density * L)
-                low = np.zeros(gt_points.shape[0], dtype=bool)
-                low[owned] = alpha[assigned[owned]] < a.threshold
+                low = low_mask(alpha)
                 gtm = gt_np.copy()
                 before = int((gtm != 0).sum())
                 gtm[low] = 0
