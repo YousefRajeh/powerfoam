@@ -44,7 +44,7 @@ def kkt(a, grad):
     return float(torch.minimum(a, grad).abs().max())
 
 
-def cache_path(scene, kmax, sam_level, n_views):
+def cache_path(scene, kmax, sam_level, n_views, keep_bg=False):
     """The key must encode EVERYTHING the cache depends on.
 
     Keying on kmax alone was a silent-corruption bug: a truncated --max-views run wrote a cache
@@ -54,7 +54,8 @@ def cache_path(scene, kmax, sam_level, n_views):
     re-checked on load so a stale file fails loudly instead of substituting itself.
     """
     return (f"artifacts/scannet/{scene}/gram_cache_K{kmax}"
-            f"_l{str(sam_level).replace(',', '')}_v{n_views}.pt")
+            f"_l{str(sam_level).replace(',', '')}_v{n_views}"
+            f"{'_bgkeep' if keep_bg else '_bgdrop'}.pt")
 
 
 def build(a_args, device="cuda"):
@@ -87,10 +88,13 @@ def build(a_args, device="cuda"):
     stems = sorted(q.stem for q in (Path(args.data_path) / args.scene / "images").iterdir())
     assert len(stems) == len(cameras)
     n_views = len(cameras) if a_args.max_views is None else min(a_args.max_views, len(cameras))
-    cp = cache_path(a_args.scene, kmax, a_args.sam_level, n_views)
+    cp = cache_path(a_args.scene, kmax, a_args.sam_level, n_views,
+                    getattr(a_args, "keep_background", False))
     if os.path.exists(cp) and not a_args.rebuild_cache:
         t0 = time.time()
         c = torch.load(cp, map_location=device, weights_only=True)
+        assert c.get("keep_background") == bool(getattr(a_args, "keep_background", False)), \
+            f"stale cache {cp}: keep_background mismatch"
         assert c["kmax"] == kmax and c["n_views"] == n_views and c["sam_level"] == str(a_args.sam_level),             f"stale cache {cp}: {c.get('kmax')},{c.get('n_views')},{c.get('sam_level')} != {kmax},{n_views},{a_args.sam_level}"
         print(f"[cache] loaded {cp} ({os.path.getsize(cp)/2**30:.2f} GiB, {n_views} views, "
               f"{time.time()-t0:.0f}s)", flush=True)
@@ -128,6 +132,23 @@ def build(a_args, device="cuda"):
         rows = torch.repeat_interleave(torch.arange(npix, device=device), slots_used.long())
         f_pix = fmap.reshape(-1, D)
 
+        # DROP BACKGROUND RAYS. 11.88% of pixels have no SAM mask at level 3, so the loader
+        # returns b_r = 0. Those rays are counted in full in S = A^T A (which is built from
+        # WEIGHTS only) while contributing nothing to A^T b, so the least-squares objective is
+        # asked to drive sum_j A_rj f_j -> 0 along them -- satisfiable only by CANCELLATION
+        # between cells, i.e. exactly the negative coefficients that push the solution off the
+        # CLIP cone. This penalises the coupled solves and leaves the diagonal estimator
+        # untouched (those rays inflate its denominator but not its numerator, so only the NORM
+        # shrinks and the DIRECTION, which is all evaluation sees, is unchanged). The comparison
+        # was therefore biased against our own method. A background ray carries no information
+        # about any cell's semantics and belongs in neither side of the normal equations.
+        if not a_args.keep_background:
+            bg = f_pix.norm(dim=-1) <= 1e-6
+            live_nz = ~bg[rows]
+            if not bool(live_nz.all()):
+                cols, vals, rows = cols[live_nz], vals[live_nz], rows[live_nz]
+                slots_used = torch.zeros_like(slots_used).index_add_(
+                    0, rows, torch.ones_like(rows, dtype=slots_used.dtype))
         w_cell = torch.zeros(P, device=device).index_add_(0, cols, vals)
         f_cell = torch.zeros(P, D, device=device)
         CH = 1_000_000
@@ -173,7 +194,8 @@ def build(a_args, device="cuda"):
     cache = {"S_keys": k.cpu(), "S_vals": v.cpu(), "Atb": Atb.cpu(),
              "support": support.cpu(), "top_w": top_w.cpu(),
              "U": U.cpu(), "P": P, "kmax": kmax,
-             "n_views": n_views, "sam_level": str(a_args.sam_level)}
+             "n_views": n_views, "sam_level": str(a_args.sam_level),
+             "keep_background": bool(getattr(a_args, "keep_background", False))}
     os.makedirs(os.path.dirname(cp), exist_ok=True)
     torch.save(cache, cp)
     print(f"[cache] wrote {cp} ({os.path.getsize(cp)/2**30:.2f} GiB)", flush=True)
@@ -292,6 +314,8 @@ def main():
     p.add_argument("--kmax", type=int, default=12,
                    help="observations cached per cell; topk slices this prefix")
     p.add_argument("--rebuild-cache", action="store_true")
+    p.add_argument("--keep-background", action="store_true",
+                   help="keep rays with b_r = 0 (reproduces pre-fix numbers)")
     p.add_argument("--merge-limit", type=int, default=60_000_000)
     p.add_argument("--max-edges", type=int, default=60_000_000,
                    help="coupling budget; see validate_pruning.py for the measured error")
