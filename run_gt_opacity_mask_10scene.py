@@ -49,7 +49,7 @@ SCENES = {
     "scene0000_00": "train", "scene0062_00": "train", "scene0070_00": "train",
     "scene0097_00": "train", "scene0140_00": "train", "scene0200_00": "train",
     "scene0347_00": "train", "scene0400_00": "train", "scene0590_00": "train",
-    "scene0645_00": "train",
+    "scene0645_00": "val",   # the one scene of the ten that is NOT in Pointcept's train split
 }
 CLASS_SETS = ["opengaussian19", "opengaussian15", "opengaussian10"]
 K_FLAT = 320
@@ -62,13 +62,20 @@ def main():
     p.add_argument("--lengths", default="radius2,0.01,0.05")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output", default="artifacts/scannet/gt_opacity_mask_10scene.json")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip scenes already present in --output instead of recomputing them.")
     a = p.parse_args()
     enable_determinism()
     device = "cuda"
     lengths = a.lengths.split(",")
 
-    out = {}
+    # Resume: the JSON is rewritten after every scene, so a crash late in the list (e.g. the
+    # scene0645_00 split typo) costs only the scenes that had not finished.
+    out = json.load(open(a.output)) if os.path.exists(a.output) and a.resume else {}
     for scene, split in SCENES.items():
+        if scene in out:
+            print(f"\n===== {scene} (cached) =====", flush=True)
+            continue
         print(f"\n===== {scene} =====", flush=True)
         gt_dir = os.path.join(GT_ROOT, split, scene)
         gt_points, raw_labels, all_names = load_scannet_pointcept_gt(gt_dir, "segment20")
