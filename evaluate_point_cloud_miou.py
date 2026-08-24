@@ -96,7 +96,7 @@ def embed_class_names(class_names, device, match_opengaussian=True):
     return F.normalize(text_feats, dim=-1)
 
 
-def classify_primitives(primitive_features, text_feats, hubness_correct=True):
+def classify_primitives(primitive_features, text_feats, hubness_correct=False):
     """(P, C) raw primitive features x (K, C) normalized text features -> (P,) argmax class
     index in [0, K-1] (caller adds +1 to land in the 1..K GT label space).
 
@@ -110,8 +110,21 @@ def classify_primitives(primitive_features, text_feats, hubness_correct=True):
     mean=0.216/std=0.028, equal means but window wins far more argmax comparisons). Standardizing
     each class's similarity column to zero-mean/unit-variance before comparing removes this
     scale bias. This is a real, literature-grounded correction for a documented phenomenon, not
-    a tuned heuristic -- but even after it, one class can still noticeably over-predict (see
-    ResearchVault writeup), so treat these numbers as a first, imperfect pass, not a final one.
+    a tuned heuristic.
+
+    DEFAULT CHANGED TO False (2026-08-25). It is NOT part of the benchmark protocol. OpenGaussian's
+    scripts/eval_scannet.py:155-159 does a bare `F.normalize` on both sides, a cosine, and an
+    argmax -- no standardization -- and NormLift's my_eval_scannet2.py does the same. Leaving this
+    on meant every number we produced used a DIFFERENT decision rule from the benchmark we compare
+    against, which is a protocol violation regardless of which way it moves the score.
+
+    It also measured WORSE under their rule. On scene0347_00 (L3 features), matched everything
+    else: hubness ON mIoU 0.2693 / mAcc 0.3347 versus plain argmax 0.3650 / 0.4932. An independent
+    audit of OpenGaussian's own full-19-name query protocol reproduced the sign (39.83 plain vs
+    38.84 hubness per-cell; 40.89 vs 38.15 after 320-cluster pooling). The correction was tuned
+    against a restricted, classes-present-only query set and does not survive the real one.
+
+    Pass hubness_correct=True explicitly for ablation rows; never for a headline number.
     """
     unit_features = F.normalize(primitive_features, dim=-1)
     sim = unit_features @ text_feats.T  # (P, K)

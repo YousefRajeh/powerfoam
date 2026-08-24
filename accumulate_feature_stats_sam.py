@@ -30,7 +30,7 @@ from powerfoam.feature_operator import accumulate_feature_stats_for_views
 from feature_foam_lifting.operator import AccumulatedFeatureStats  # noqa: F401 (import path sanity)
 
 
-def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, height: int = 480, width: int = 640, sam_level=None) -> torch.Tensor:
+def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, height: int = 480, width: int = 640, sam_level=None, skip_normalize: bool = False) -> torch.Tensor:
     """Copied verbatim from gsplat_ext/datasets/normalize.py (with the float() fix already
     applied there this session for the fp16-on-disk issue), EXCEPT the missing-feature
     placeholder shape, which is now parameterized by the actual camera resolution rather than
@@ -96,12 +96,19 @@ def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, h
               f"exist) -- treating as background")
         segment = segment.masked_fill(oob, 0)
     feat_map = F.embedding(segment, features_pad).sum(dim=0)
-    feat_map = feat_map / (feat_map.norm(dim=-1, keepdim=True) + 1e-6)
+    if not skip_normalize:
+        feat_map = feat_map / (feat_map.norm(dim=-1, keepdim=True) + 1e-6)
+    # Without the renormalization the pixel feature keeps its MAGNITUDE, which for a
+    # multi-level sum is |sum of up to 4 unit vectors| -- large where the granularity levels
+    # AGREE, small where they disagree. Since the lift accumulates A_rj * b_r, that magnitude
+    # acts as a per-pixel confidence weight rather than a change of direction. For a SINGLE
+    # level it is a no-op: the stored per-mask CLIP embeddings are already unit norm
+    # (measured 0.9996-1.0004), so the sum over one channel is already normalized.
     return feat_map
 
 
 def main(scene: str, config_path: str, feature_folder: str, output_path: str, batch_size: int = 1,
-         images_subdir: str = "images", feature_name_format: str = None, sam_level=None,
+         images_subdir: str = "images", feature_name_format: str = None, sam_level=None, skip_normalize: bool = False,
          weight_transform=None):
     wp.init()
     parser = configargparse.ArgParser()
@@ -151,7 +158,7 @@ def main(scene: str, config_path: str, feature_folder: str, output_path: str, ba
 
     def load_feature_map(view_id):
         camera = cameras[view_id]
-        return load_image_feature_from_SAMOpenCLIP(feature_dir, image_names[view_id], height=camera.height, width=camera.width, sam_level=sam_level)
+        return load_image_feature_from_SAMOpenCLIP(feature_dir, image_names[view_id], height=camera.height, width=camera.width, sam_level=sam_level, skip_normalize=skip_normalize)
 
     print(f"[accumulate_feature_stats_sam] scene={scene} views={len(indices)} num_primitives={model.points.shape[0]} batch_size={batch_size}")
     torch.cuda.synchronize()
@@ -183,9 +190,11 @@ if __name__ == "__main__":
                         "surf<tau> = drop cells behind the transmittance-tau surface "
                         "(e.g. surf0.5 = the median-depth surface our CD-L1 extraction "
                         "already uses); keeps soft weights in front of it")
+    p.add_argument("--skip-normalize", action="store_true",
+                   help="Do NOT L2-normalize the per-pixel feature; keeps multi-level agreement as a magnitude/confidence weight.")
     p.add_argument("--sam-level", type=str, default=None,
                    help="use only this SAM granularity level (3 = whole/l-level, the "
                         "OpenGaussian/NormLift convention); default sums all levels")
     cli_args = p.parse_args()
     main(cli_args.scene, cli_args.config, cli_args.feature_folder, cli_args.output, cli_args.batch_size,
-         images_subdir=cli_args.images_subdir, feature_name_format=cli_args.feature_name_format, sam_level=cli_args.sam_level, weight_transform=cli_args.weight_transform)
+         images_subdir=cli_args.images_subdir, feature_name_format=cli_args.feature_name_format, sam_level=cli_args.sam_level, weight_transform=cli_args.weight_transform, skip_normalize=cli_args.skip_normalize)

@@ -4,7 +4,7 @@ Replicates the SHAPE of OpenGaussian's two-level codebook protocol (their eval n
 classifies per-primitive): 64 root clusters on primitive POSITION, then up to 5 leaf
 clusters on solved CLIP features within each root (64 x 5 = 320 leaves, their exact
 codebook size), mean-pool the unit features per leaf, classify each pooled feature once
-against the class-set text embeddings (same hubness-corrected argmax as the baseline
+against the class-set text embeddings (plain cosine argmax, matching OpenGaussian
 protocol), broadcast the leaf's class to every member primitive, then score points via
 the usual power-cell assignment.
 
@@ -24,6 +24,7 @@ sys.path.insert(0, r"D:\Downloads\powerfoam")
 
 from determinism import enable_determinism
 import numpy as np
+import os
 import torch
 import torch.nn.functional as F
 
@@ -119,7 +120,18 @@ def main():
 
     for scene, split in SCENES.items():
         ckpt_dir = f"output/scannet_{scene}_nonfrozen"
-        features_path = f"artifacts/scannet/{scene}/solved_geometric_median_nonfrozen.pt"
+        # SUFFIX selects which SAM-level construction to score. Default '' is the all-levels
+        # normalized sum (splat-distiller/NormLift's construction); '_l3' is level-3 (large)
+        # only, which is what OpenGaussian uses for LeRF. Their ScanNet script uses level 0.
+        # DEFAULT IS _l3. Measured 10-scene, protocol-correct plain argmax, nonfrozen:
+        #   all-levels  27.64/28.62/34.47 mIoU (45.87/45.91/52.40 mAcc)
+        #   level 3     32.84/34.38/41.13 mIoU (56.46/58.21/63.34 mAcc)
+        # i.e. +5.2/+5.8/+6.7 mIoU and ~+11 mAcc on every class set and both clusterings.
+        # The all-levels normalized sum is splat-distiller's loader default, which NormLift
+        # inherits -- but OpenGaussian uses a SINGLE level (0 for ScanNet, 3 for LeRF), never
+        # the sum. Set FEAT_SUFFIX='' to score the all-levels construction as an ablation row.
+        suffix = os.environ.get("FEAT_SUFFIX", "_l3")
+        features_path = f"artifacts/scannet/{scene}/solved_geometric_median_nonfrozen{suffix}.pt"
         gt_dir = rf"D:\Downloads\scannet_pointcept\{split}\{scene}"
 
         print(f"\n===== {scene} =====", flush=True)

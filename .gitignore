@@ -36,3 +36,6 @@ notebooks/__marimo__/
 /checkpoints
 # 3.2GB of Gaussian baseline checkpoints/features -- data, not code
 /gaussian_baseline_scannet
+smoke_whitepad/
+smoke6/
+configs/_tf_*.yaml
