@@ -142,6 +142,11 @@ class Params:
         default_factory=lambda: [0.1, 0.9])
     distortion_min_alpha: float = 0.5
     experiment_name: str = ""
+    # When true, the point SET is held fixed: no resampling, no Morton re-sort, no
+    # adjacency rebuild. Required for OpenGaussian's --frozen_init_pts protocol, where
+    # primitive i must remain GT point i for the whole run. `points_lr = 0` alone is NOT
+    # sufficient -- see patch_powerfoam_freeze.py for the measured dose-response.
+    freeze_points: bool = False
     dry_run: bool = False
     viewer: bool = False
     # Enable external normal supervision.  When False (default), the only

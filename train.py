@@ -505,7 +505,7 @@ def train(args):
                 else:
                     current_target = model.points.shape[0]
 
-                if i < int(0.95 * args.iterations) and i % 100 == 99:
+                if (not args.freeze_points) and i < int(0.95 * args.iterations) and i % 100 == 99:
                     with viewer_lock:
                         num_resampled = model.resample(current_target)
                         model.sort_points()
