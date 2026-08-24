@@ -231,6 +231,21 @@ def accumulate_feature_stats_for_views(
             out_val = hard.reshape(-1)
         elif weight_transform == "sq":
             out_val = out_val * out_val
+        elif weight_transform == "tau":
+            # 'tau' -- weight by OPTICAL DEPTH instead of alpha.
+            #
+            # Motivation: A_rj = alpha*T with alpha = 1 - exp(-tau), tau = sigma_j * dt_rj, so
+            # tau is literally the density integral along the segment the ray cuts through the
+            # cell. Weighting by the traversed FRACTION dt/diameter is what one would want if a
+            # barely-clipped large cell should count less than a fully-crossed small one -- and
+            # dt/diam = tau/(sigma_j*diam_j), whose denominator is a PER-CELL CONSTANT that
+            # cancels in the per-primitive normalization. So that proposal reduces exactly to
+            # weighting by tau, with no geometry term needed.
+            #
+            # Measured on scene0347_00: alpha/tau q10/q50/q90 = 0.758/0.926/0.982 and 87.2% of
+            # cells sit at tau < 0.5, so this is a MILD monotone sharpening -- weaker than 'sq'.
+            # Expect a small effect; that expectation is recorded here before the run.
+            out_val = -torch.log1p(-out_val.clamp(max=1.0 - 1e-7))
         elif weight_transform is not None and weight_transform.startswith("surf"):
             # 'surf<tau>' -- occlusion truncation. The export kernel walks each ray
             # front-to-back and keeps depositing alpha*trans into cells until
