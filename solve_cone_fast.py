@@ -255,6 +255,32 @@ def prepare(cache, topk, device="cuda", max_edges=60_000_000):
     return Hb, c, U, have, dn, valid, x_diag, P, Kt
 
 
+def _gram_lambda_max(U, chunk=100_000, n_power=10):
+    """lambda_max(U_j U_j^T) for every cell, batched, via power iteration.
+
+    NOT eigvalsh. Batched cuSOLVER syevj returns CUSOLVER_STATUS_INVALID_VALUE on this input
+    because a cell that was never observed has an all-zero basis and hence an all-zero K x K
+    Gram matrix. Power iteration handles that block gracefully -- it simply stays at zero -- and
+    ten steps is ample for a 7 x 7 whose spectrum is dominated by a single direction (the basis
+    vectors are near-duplicate views of the same surface, so the leading gap is large).
+    """
+    P, K = U.shape[0], U.shape[1]
+    lam = torch.zeros(P, device=U.device)
+    for s in range(0, P, chunk):
+        e = min(s + chunk, P)
+        Uc = U[s:e].float()          # cast once: (chunk, K, 512) fp32 is ~1.4 GiB at chunk=1e5
+        Gm = torch.bmm(Uc, Uc.transpose(1, 2))
+        del Uc
+        v = torch.ones(Gm.shape[0], K, 1, device=Gm.device)
+        v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+        for _ in range(n_power):
+            w = torch.bmm(Gm, v)
+            v = w / w.norm(dim=1, keepdim=True).clamp_min(1e-30)
+        lam[s:e] = torch.bmm(v.transpose(1, 2), torch.bmm(Gm, v)).squeeze(-1).squeeze(-1)
+        del Gm, v, w
+    return lam
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--scene", required=True)
@@ -270,6 +296,9 @@ def main():
     p.add_argument("--max-edges", type=int, default=60_000_000,
                    help="coupling budget; see validate_pruning.py for the measured error")
     p.add_argument("--iters", type=int, default=300)
+    p.add_argument("--log-every", type=int, default=25,
+                   help="KKT is non-monotone, so a coarse log can hide where a threshold is "
+                        "actually first crossed; set to 1 for an A/B on iterations-to-KKT")
     p.add_argument("--max-views", type=int, default=None)
     p.add_argument("--restart", type=int, default=1,
                    help="1 = adaptive gradient restart (default), 0 = plain FISTA, for A/B")
@@ -279,7 +308,8 @@ def main():
     p.add_argument("--fallback", type=int, default=1,
                    help="1 = zeroed cells fall back to the diagonal (default), 0 = leave them empty")
     p.add_argument("--precond", type=int, default=1,
-                   help="1 = per-cell diagonal preconditioning (default), 0 = single global step")
+                   help="0 = single global step, 1 = per-cell Frobenius row-block bound "
+                        "(default), 2 = per-cell SQS majorizer d_j*lambda_max(U_j U_j^T)")
     a = p.parse_args()
     device = "cuda"
 
@@ -318,16 +348,43 @@ def main():
         L = float(Hv.norm())
         v = Hv / max(L, 1e-12)
     if a.precond:
-        rs = Hb.row_block_norms()
+        if a.precond == 2:
+            # ---- change 5: the SQS majorizer, a Loewner-order bound rather than a norm bound.
+            # A is row-substochastic here: the cells of a power diagram are DISJOINT, so a ray
+            # visits each at most once, and alpha-compositing transmittance telescopes,
+            # sum_k alpha_k T_k = 1 - T_final <= 1. Jensen on the non-negative rows then gives
+            #     A^T A <= diag(d),   d = A^T A 1 = row sums of S,
+            # an inequality between MATRICES, not merely between their norms. Pushed through
+            # f_j = U_j^T a_j this yields the per-cell constant
+            #     L_j^SQS = d_j * lambda_max(U_j U_j^T),
+            # versus the Gershgorin/Frobenius bound sum_l ||B_{jl}||_F used by --precond 1.
+            # Since ||G_{jl}||_F <= K for unit rows, the Frobenius bound is roughly K*d_j while
+            # this one is lambda_max(Gram_j)*d_j, so the gain is the ratio lambda_max/K -- which
+            # diagnose_conditioning.py measured at 4.736/7 on scene0347_00, i.e. a ~20% larger
+            # step and nothing like a step change. Both paths are kept so that stays measurable.
+            d = Hb.row_sums_S()
+            lam = _gram_lambda_max(U)
+            rs = d * lam
+            fro = Hb.row_block_norms()
+            am = (rs > 0) & (fro > 0)
+            print(f"[precond] SQS: lambda_max(U_j U_j^T) median {float(lam[am].median()):.3f} "
+                  f"of K={K}   L^SQS/L^Frobenius median "
+                  f"{float((rs[am]/fro[am]).median()):.4f}", flush=True)
+            del d, lam, fro
+        else:
+            rs = Hb.row_block_norms()
         # A cell with no edge in S was never crossed by any ray. Clamping its L_j to a tiny
         # epsilon would hand it a step of ~1e12; it is inert today only because `have` masks it,
-        # which is too fragile to rely on. Give it exactly zero step instead.
+        # which is too fragile to rely on. Give it exactly zero step instead. The SQS path needs
+        # this for the SAME reason and one more: an unobserved cell has a zero Gram, so its
+        # lambda_max is exactly 0 and L_j^SQS = 0 even where d_j > 0.
         alive = rs > 0
         eta = torch.zeros(P, device=device)
         eta[alive] = 1.0 / rs[alive]
         eta = eta[:, None]
         q = torch.quantile(rs[alive].float(), torch.tensor([0.01, 0.5, 0.99], device=device))
-        print(f"[precond] per-cell L_j percentiles 1/50/99: {q[0]:.3e} {q[1]:.3e} {q[2]:.3e}"
+        print(f"[precond] mode {a.precond} per-cell L_j percentiles 1/50/99: "
+              f"{q[0]:.3e} {q[1]:.3e} {q[2]:.3e}"
               f"   spread {float(q[2]/q[0]):.1f}x   (global L={L:.4e}, {int(alive.sum())}/{P} cells alive)", flush=True)
     else:
         eta = 1.0 / max(L, 1e-12)
@@ -360,7 +417,7 @@ def main():
             t_new = 0.5 * (1.0 + (1.0 + 4.0 * t * t) ** 0.5)
             y = (new + ((t - 1.0) / t_new) * (new - coef)).clamp_min(0.0) * hf
         coef, t = new, t_new
-        if it % 25 == 0 or it == a.iters - 1:
+        if it % a.log_every == 0 or it == a.iters - 1:
             gg = grad(coef)
             print(f"[fista] iter {it:4d}  obj {obj(coef):.6e}  KKT {kkt(coef, gg):.6e}  "
                   f"restarts {n_restarts}  stat {restart_stat:+.3e}  ({time.time()-t0:.1f}s)", flush=True)

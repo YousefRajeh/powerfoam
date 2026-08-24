@@ -420,10 +420,19 @@ def propagate_leftovers(labels, adjacent, offsets, unit_feats, valid_mask_t, num
 
 def eval_scene(scene, split, threshold, device, class_sets, text_cache, mode="capped",
                normal_tau=0.8, plane_tau=0.9, coplanar_eps=0.05, min_plane_size=500,
-               restrict_owners=False, point_weight=False, consolidate_min=200, suffix=""):
+               restrict_owners=False, point_weight=False, consolidate_min=200, suffix="",
+               adjacency=None, seed=0):
     ckpt_dir = f"output/scannet_{scene}_nonfrozen"
     features_path = f"artifacts/scannet/{scene}/solved_geometric_median_nonfrozen{suffix}.pt"
-    adjacency_path = f"artifacts/scannet/{scene}/adjacency_nonfrozen.pt"
+    # adjacency default = the historical BALL-OVERLAP CECH COMPLEX (see
+    # convert_true_facet_graph.py); pass adjacency="true_facet" or an explicit path for
+    # the real power-diagram facet graph.
+    if adjacency in (None, "cech"):
+        adjacency_path = f"artifacts/scannet/{scene}/adjacency_nonfrozen.pt"
+    elif adjacency == "true_facet":
+        adjacency_path = f"artifacts/scannet/{scene}/adjacency_true_facet.pt"
+    else:
+        adjacency_path = adjacency
     gt_dir = rf"D:\Downloads\scannet_pointcept\{split}\{scene}"
 
     gt_points, raw_labels, all_names = load_scannet_pointcept_gt(gt_dir, "segment20")
@@ -440,6 +449,8 @@ def eval_scene(scene, split, threshold, device, class_sets, text_cache, mode="ca
     valid_mask = solved["valid_mask"].cpu().numpy()
     adj = torch.load(adjacency_path, map_location=device, weights_only=True)
     adjacent, offsets = adj["adjacent"].to(device).long(), adj["offsets"].to(device).long()
+    print(f"  [{scene}] graph={adjacency_path} E={adjacent.numel()} "
+          f"mean_deg={adjacent.numel() / (offsets.numel() - 1):.2f}", flush=True)
 
     unit_all = torch.zeros_like(feats)
     vm_t = torch.from_numpy(valid_mask).to(device)
@@ -495,7 +506,7 @@ def eval_scene(scene, split, threshold, device, class_sets, text_cache, mode="ca
         from run_cluster_classify_eval import two_level_position_aware, K_FLAT
         vi = torch.where(vm_t)[0]
         pos_v = torch.from_numpy(centers[vi.cpu().numpy()]).to(device).float()
-        leaf = two_level_position_aware(pos_v, unit_all[vi], seed=0)
+        leaf = two_level_position_aware(pos_v, unit_all[vi], seed=seed)
         labels = torch.full((unit_all.shape[0],), -1, dtype=torch.long, device=device)
         labels[vi] = leaf
         num_regions = K_FLAT
@@ -613,32 +624,44 @@ def main():
     p.add_argument("--coplanar-eps", type=float, default=0.05)
     p.add_argument("--min-plane-size", type=int, default=500)
     p.add_argument("--mode", choices=["capped", "exhaustive", "exhaustive_mean", "batched", "batched_normal", "plane_first", "plane_ransac", "kmeans_pos", "batched_consolidated"], default="capped")
+    p.add_argument("--adjacency", default=None,
+                   help="'cech' (default, the historical ball-overlap graph), 'true_facet' "
+                        "(the real power-diagram facet graph from convert_true_facet_graph.py), "
+                        "or an explicit CSR .pt path")
+    p.add_argument("--seeds", default="0", help="comma-separated clustering seeds "
+                   "(only kmeans_pos uses a seed; growing modes are deterministic)")
     p.add_argument("--output", default=None)
     args = p.parse_args()
 
+    from determinism import enable_determinism
+    enable_determinism()
     device = "cuda"
     scenes = SCENES if args.scenes == "all" else {s: SCENES[s] for s in args.scenes.split(",")}
     thresholds = [float(t) for t in args.thresholds.split(",")]
     class_sets = CLASS_SETS if args.class_sets == "all" else args.class_sets.split(",")
     text_cache = {}
 
+    seeds = [int(s) for s in args.seeds.split(",")]
     summary = {}
     for thr in thresholds:
+      for sd in seeds:
         results = {cs: {} for cs in class_sets}
         for scene, split in scenes.items():
             per_cs = eval_scene(scene, split, thr, device, class_sets, text_cache, mode=args.mode,
                                 normal_tau=args.normal_tau, plane_tau=args.plane_tau,
                                 coplanar_eps=args.coplanar_eps, min_plane_size=args.min_plane_size,
                                 restrict_owners=args.restrict_owners, point_weight=args.point_weight,
-                                consolidate_min=args.consolidate_min, suffix=args.suffix)
+                                consolidate_min=args.consolidate_min, suffix=args.suffix,
+                                adjacency=args.adjacency, seed=sd)
             for cs, m in per_cs.items():
                 results[cs][scene] = m
-        summary[str(thr)] = {}
-        line = [f"thr={thr}"]
+        key = str(thr) if len(seeds) == 1 else f"{thr}|seed{sd}"
+        summary[key] = {}
+        line = [f"thr={thr}", f"seed={sd}"]
         for cs in class_sets:
             mious = [m["mIoU"] for m in results[cs].values()]
             maccs = [m["mAcc"] for m in results[cs].values()]
-            summary[str(thr)][cs] = {
+            summary[key][cs] = {
                 "num_scenes": len(mious),
                 "mean_mIoU": float(np.mean(mious)),
                 "mean_mAcc": float(np.mean(maccs)),

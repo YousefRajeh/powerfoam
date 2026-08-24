@@ -84,6 +84,7 @@ def main():
 
     betas = []          # beta_i on rays that carry a real CLIP observation (B_i != 0)
     betas_bg = []       # beta_i on rays whose pixel has no mask at this SAM level (B_i == 0)
+    mus = []            # mu_i, to test whether the beta tail is just mu_i -> 0
     nprim = []          # number of primitives on each kept ray
     rowsums = []        # sum_j A_ij on each kept ray -- evidence for the substochastic fix
     n_rays_total = 0
@@ -149,6 +150,7 @@ def main():
         has_obs = f_pix.norm(dim=-1) > 0
         sel = ok & has_obs
         betas.append(b[sel].float().cpu())
+        mus.append(mu[sel].float().cpu())
         nprim.append(cnt[sel].float().cpu())
         rowsums.append(w_sum[sel].float().cpu())
         betas_bg.append(b[ok & ~has_obs].float().cpu())
@@ -191,6 +193,17 @@ def main():
     if Sbg is not None:
         print(f"  [control] beta_i on the {Sbg['n']:,} rays with NO observation (B_i = 0, so "
               f"Delta_ij = ||x_hat_j||): median {Sbg['median']:.4f}  max {Sbg['max']:.4f}")
+    # Is the beta tail real cross-talk, or just mu_i -> 0? beta_i = sigma_i^2/mu_i^2 blows up
+    # on rays the field fits almost perfectly (mu_i ~ 0), where a tiny ABSOLUTE spread is a huge
+    # RELATIVE one. Those rays have essentially no loss to recover, so they should not be
+    # allowed to set the constant in a loss bound. Test: drop the 1% of rays with smallest mu_i.
+    allmu = torch.cat(mus)
+    mu_lo = float(np.percentile(allmu.numpy().astype(np.float64), 1))
+    Strim = qs(allb[allmu > mu_lo])
+    print(f"\n  mu_i (weighted mean ||x_hat_j - B_i||): median {float(allmu.median()):.4f}  "
+          f"p1 {mu_lo:.4f}  min {float(allmu.min()):.2e}")
+    print(f"  beta_i after dropping the 1% smallest-mu rays: median {Strim['median']:.4f}  "
+          f"p99.9 {Strim['p999']:.4f}  MAX {Strim['max']:.4f}")
     print(f"\n  SFS bound: L(x') <= (1 + beta) L(x_hat), beta = MAX_i beta_i")
     print(f"  -> worst-case looseness of back-projection on this scene: "
           f"{S['max']*100:.1f}% above optimal")
@@ -203,6 +216,8 @@ def main():
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
         json.dump({"scene": a.scene, "xhat": a.xhat, "observed": S, "multi_primitive": Smulti,
                    "no_observation_control": Sbg, "n_pixels_rendered": n_rays_total,
+                   "trimmed_smallest_1pct_mu": Strim, "mu_median": float(allmu.median()),
+                   "mu_p1": mu_lo,
                    "prims_per_ray_median": float(npr.median()),
                    "prims_per_ray_mean": float(npr.mean()),
                    "rowsum_median": float(rs.median()), "rowsum_mean": float(rs.mean())},

@@ -103,8 +103,16 @@ def main():
     U = c["U"][:, :a.topk].float()
     Ufull = torch.zeros(P, K, U.shape[-1], device=device)
     Ufull[:, :a.topk] = U
-    # the augmented direction is a unit vector too; its exact value does not change lambda_max
-    # materially, and this diagnostic is about the RATIO of the two bounds
+    # CORRECTED CLAIM. This used to say the augmented direction "does not change lambda_max
+    # materially". It does, and that error is the whole of the predicted SQS gain. Row K-1 is
+    # left ZERO here, so the Gram is really 6x6 padded to 7x7 and lambda_max comes out 4.736.
+    # The solver fills that row with x_diag/||x_diag||, the diagonal answer -- which is a
+    # weighted average of the SAME observed embeddings and therefore nearly parallel to them.
+    # Adding a seventh near-parallel direction pushes lambda_max to 5.720 (measured by
+    # solve_cone_fast --precond 2), a factor of 1.21, which is exactly the "gain" this script
+    # reported. Measured against the real K=7 basis, L^SQS/L^Frobenius has median 1.0057:
+    # the SQS bound is 0.6% LOOSER than the Frobenius one, not 23% tighter. Treat the numbers
+    # below as a bound on a basis the solver does not use.
     lam = torch.zeros(P, device=device)
     CH = 100_000
     # Power iteration rather than eigvalsh: batched cusolver syevj fails here
@@ -127,9 +135,10 @@ def main():
           f"(K would mean perfectly correlated basis vectors, 1 means orthonormal)")
     lq = torch.quantile(L_sqs[alive].float(), q)
     print(f"  L_j^SQS = d_j * lambda_max(Gram_j): median {float(lq[2]):.4e}")
-    print(f"\n  A SMALLER L_j means a LARGER admissible step. Compare against the Frobenius")
-    print(f"  row-block bound currently in use by running solve_cone_fast with --precond 1")
-    print(f"  and reading its [precond] line.")
+    print(f"\n  WARNING: the augmented (diagonal-answer) direction is ZERO in this script's basis,")
+    print(f"  so this lambda_max is optimistic -- see the comment above. The bound the solver")
+    print(f"  actually gets is printed by solve_cone_fast --precond 2, and on scene0347_00 it is")
+    print(f"  0.6% LOOSER than the --precond 1 Frobenius bound, not tighter.")
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ import sys
 sys.path.insert(0, r"D:\Downloads\feature-foam-lifting\src")
 sys.path.insert(0, r"D:\Downloads\powerfoam")
 
+from determinism import enable_determinism
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -70,11 +71,23 @@ def connected_components(labels, adjacent, offsets, n_labels, device):
 
 
 def main():
+    enable_determinism()
     p = argparse.ArgumentParser()
     p.add_argument("--scene", default="scene0000_00")
     p.add_argument("--variant", default="nonfrozen")
     p.add_argument("--gt-root", default=r"D:\Downloads\scannet_pointcept")
     p.add_argument("--refine", type=int, default=3)
+    # Graph selection. The default path is the BALL-OVERLAP CECH COMPLEX that every
+    # earlier run of this script consumed (scene.py::rebuild_adjacency ->
+    # bvh.py::build_cech_complex, d < r_i + r_j on half the AABB x-extent). Pass
+    # --adjacency artifacts/scannet/<scene>/adjacency_true_facet.pt for the real
+    # power-diagram facet graph (see convert_true_facet_graph.py).
+    p.add_argument("--adjacency", default=None,
+                   help="CSR adjacency .pt; default artifacts/scannet/<scene>/adjacency_<variant>.pt")
+    p.add_argument("--comp-adjacency", default=None,
+                   help="if set, use THIS graph for the connected-component count only, "
+                        "keeping --adjacency for feature refinement (isolates the graph effect "
+                        "on the locality statistic from its effect on the clustering)")
     p.add_argument("--output", default=None)
     a = p.parse_args()
 
@@ -100,9 +113,20 @@ def main():
         del st
     else:
         R = vm_t.float()
-    adj = torch.load(f"artifacts/scannet/{scene}/adjacency_{variant}.pt",
-                     map_location=device, weights_only=True)
+    adj_path = a.adjacency or f"artifacts/scannet/{scene}/adjacency_{variant}.pt"
+    adj = torch.load(adj_path, map_location=device, weights_only=True)
     adjacent, offsets = adj["adjacent"].to(device).long(), adj["offsets"].to(device).long()
+    deg_all = (offsets[1:] - offsets[:-1]).float()
+    print(f"  graph: {adj_path}  E={adjacent.numel()} mean_deg={float(deg_all.mean()):.2f}")
+    if a.comp_adjacency:
+        cadj = torch.load(a.comp_adjacency, map_location=device, weights_only=True)
+        comp_adjacent = cadj["adjacent"].to(device).long()
+        comp_offsets = cadj["offsets"].to(device).long()
+        cdeg = (comp_offsets[1:] - comp_offsets[:-1]).float()
+        print(f"  component graph: {a.comp_adjacency}  E={comp_adjacent.numel()} "
+              f"mean_deg={float(cdeg.mean()):.2f}")
+    else:
+        comp_adjacent, comp_offsets = adjacent, offsets
     positions = torch.from_numpy(centers).to(device).float()
 
     ref = unit_full
@@ -114,7 +138,7 @@ def main():
     # region id per FULL cell array (-1 where invalid), so components run on the real graph
     region_full = torch.full((centers.shape[0],), -1, dtype=torch.long, device=device)
     region_full[vi] = leaf
-    comp = connected_components(region_full, adjacent, offsets, K_FLAT, device)
+    comp = connected_components(region_full, comp_adjacent, comp_offsets, K_FLAT, device)
 
     diag = positions.max(0).values - positions.min(0).values
     scene_diag = float(diag.norm())
@@ -153,7 +177,12 @@ def main():
     n_split = int(split_leaf.max()) + 1
     print(f"\n  splitting by connected component: {K_FLAT} regions -> {n_split} regions")
 
-    out = {"scene": scene, "n_regions": len(stats), "n_split_regions": n_split,
+    out = {"scene": scene, "graph": adj_path, "comp_graph": a.comp_adjacency or adj_path,
+           "mean_degree": float(deg_all.mean()),
+           "components_mean": float(ncomp.mean()),
+           "components_p90": float(np.percentile(ncomp, 90)),
+           "largest_frac_median": float(np.median(lfrac)),
+           "n_regions": len(stats), "n_split_regions": n_split,
            "components_median": float(np.median(ncomp)),
            "single_piece_frac": float((ncomp == 1).mean()), "results": {}}
     for cs_name in ("opengaussian19", "opengaussian15", "opengaussian10"):

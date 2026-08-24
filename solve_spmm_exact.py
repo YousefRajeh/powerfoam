@@ -10,10 +10,13 @@ that restriction when most of it comes from forming S at all:
     once S = A^T A exists, the FULL 512-channel operator is just  S @ F,
     a sparse-times-dense product, with NO basis and NO restriction.
 
-At 16.2M edges and F of shape (204k, 512) that is ~65 GB of memory traffic, i.e. ~0.1-0.4 s,
-against the 33 s / 3.02 TiB of the matrix-free ray-streaming version. So the exact operator is
-50-150x faster than what we were doing, and the cone basis buys a further ~10x on top of THAT,
-not 70x on top of the matrix-free path.
+MEASURED on scene0347_00 (204k cells, 54 views, 16.2M edges, A6000), per operator application:
+    matrix-free CachedRayOperator.AtA   22.67 / 22.78 / 22.90 s
+    exact SpMM SparseGram.matvec         0.583 / 0.597 / 0.598 s
+so **38x**, not the 50-150x originally claimed here -- that estimate was too optimistic and is
+corrected. The kernel is memory-bandwidth-bound; edge chunk sizes of 500k/1M/2M/4M all give
+~0.59 s. The headline conclusion is unchanged: the bulk of the speedup comes from forming S, not
+from the cone basis, and this path is EXACT.
 
 WHAT THIS UNLOCKS. Every earlier unconstrained result was measured with the slow operator, which
 is why the ridge sweep took hours and why only scene0347_00 was ever swept. With this path the

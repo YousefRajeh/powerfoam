@@ -135,9 +135,33 @@ def merge(key_store, val_store):
 class BlockSparseHessian:
     """H in coefficient space: K x K blocks on the upper triangle of S, applied symmetrically."""
 
-    def __init__(self, j_idx, l_idx, blocks, P, K):
+    def __init__(self, j_idx, l_idx, blocks, P, K, svals=None):
         self.j, self.l, self.B, self.P, self.K = j_idx, l_idx, blocks, P, K
         self.diag_mask = j_idx == l_idx
+        # the scalar S_{jl} behind each block, kept for the SQS majorizer (see row_sums_S)
+        self.S = svals
+
+    def row_sums_S(self):
+        """d_j = sum_l S_{jl}, the row sums of the (symmetric, non-negative) coupling matrix.
+
+        This is the SQS / separable-quadratic-surrogate majorizer. For ANY symmetric matrix with
+        non-negative entries,
+
+            x^T S x = sum_{jl} S_{jl} x_j x_l <= sum_{jl} S_{jl} (x_j^2 + x_l^2)/2
+                    = sum_j d_j x_j^2,      i.e.   S <= diag(d)   in the Loewner order,
+
+        which is exactly Jensen applied row-wise. It holds for the PRUNED S stored here as well as
+        for the full one -- pruning only deletes non-negative entries, which shrinks d -- so the
+        bound computed from what the operator actually applies is both valid and tighter than one
+        computed from the unpruned matrix.
+        """
+        assert self.S is not None, "svals were not retained; rebuild with build_blocks"
+        dev = self.S.device
+        d = torch.zeros(self.P, device=dev)
+        d.index_add_(0, self.j, self.S)
+        off = ~self.diag_mask
+        d.index_add_(0, self.l[off], self.S[off])
+        return d
 
     def bytes(self):
         return self.B.numel() * 4 + self.j.numel() * 8 + self.l.numel() * 8
@@ -207,11 +231,23 @@ def prune_edges(keys, svals, P, max_edges, verbose=True):
     n_diag = int(is_diag.sum())
     budget = max(max_edges - n_diag, 0)
     off = ~is_diag
-    off_vals = svals[off]
+    # Drop exactly-zero couplings FIRST. Measured on scene0070_00: 5,651,578 off-diagonal entries
+    # are exactly 0.0, because a product of two small render weights underflows fp32. Without this
+    # filter topk returns thresh = 0.0, `svals >= 0.0` keeps EVERY edge, and the budget silently
+    # does not bind -- scene0070_00 reported "64,359,780 -> 64,359,780, retaining 100.000%" while
+    # nominally capped at 60M. Harmless for accuracy (keeping more is more exact) but it means the
+    # memory budget offers no protection on a larger scene, and millions of edges carrying zero
+    # coupling were being stored and multiplied for nothing.
+    nonzero = off & (svals > 0)
+    off_vals = svals[nonzero]
     if budget == 0 or off_vals.numel() <= budget:
-        return keys, svals, 1.0
+        keep = is_diag | nonzero
+        if int(keep.sum()) < E and verbose:
+            print(f"[prune] dropped {E - int(keep.sum()):,} exactly-zero couplings "
+                  f"({E:,} -> {int(keep.sum()):,}); budget {max_edges:,} not binding", flush=True)
+        return keys[keep], svals[keep], 1.0
     thresh = torch.topk(off_vals, budget, largest=True, sorted=False).values.min()
-    keep = is_diag | (svals >= thresh)
+    keep = is_diag | (nonzero & (svals >= thresh))
     kept_mass = float(svals[keep].sum() / svals.sum())
     if verbose:
         print(f"[prune] {E:,} -> {int(keep.sum()):,} edges (budget {max_edges:,}), "
@@ -233,4 +269,4 @@ def build_blocks(keys, svals, U, P, K, edge_chunk=200_000):
         Ul = U[l[s:e]].float()
         B[s:e] = torch.einsum("ekd,eld->ekl", Uj, Ul) * svals[s:e, None, None]
         del Uj, Ul
-    return BlockSparseHessian(j, l, B, P, K)
+    return BlockSparseHessian(j, l, B, P, K, svals=svals)
