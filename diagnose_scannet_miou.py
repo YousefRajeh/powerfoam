@@ -30,7 +30,7 @@ from evaluate_point_cloud_miou import (
 from point_cloud_query import assign_points_to_power_cells
 
 
-def load_foam(checkpoint_dir, device, return_normals=False):
+def load_foam(checkpoint_dir, device, return_normals=False, return_density=False):
     import warp as wp
     import configargparse
     from configs import Params, add_group
@@ -50,6 +50,11 @@ def load_foam(checkpoint_dir, device, return_normals=False):
     if return_normals:
         return (model.points.detach().cpu().numpy(), model.get_radii().detach().cpu().numpy(),
                 model.get_normals().detach().cpu().numpy())
+    if return_density:
+        # Unbounded volumetric density (exp/softplus, scene.py:312-313), NOT a sigmoid opacity --
+        # converting it to a comparable alpha needs a path length. See apply_gt_opacity_mask.
+        return (model.points.detach().cpu().numpy(), model.get_radii().detach().cpu().numpy(),
+                model.get_density().detach().float().cpu().numpy().reshape(-1))
     return model.points.detach().cpu().numpy(), model.get_radii().detach().cpu().numpy()
 
 

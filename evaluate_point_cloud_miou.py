@@ -120,8 +120,44 @@ def classify_primitives(primitive_features, text_feats, hubness_correct=True):
     return sim.argmax(dim=-1)
 
 
+def apply_gt_opacity_mask(gt_labels_remapped, assigned, primitive_alpha, threshold, tag):
+    """OpenGaussian's low-opacity GT masking (`eval_scannet.py:127-129`), generalized off the
+    frozen-point assumption.
+
+    THEIR RULE. With `--frozen_init_pts` there is exactly one Gaussian per GT vertex in matching
+    index order, so they can write `updated_gt_labels[sigmoid(opacity) < 0.1] = 0` -- indexing GT
+    points with a per-Gaussian mask. Label 0 is the ignore label (`gt != 0` gates both the IoU
+    union and the per-class list), so this DELETES those points from the metric rather than
+    predicting anything for them.
+
+    OUR RULE. That index identity does not survive densification, and it never held for the foam
+    at all, so we mask the point whose ASSIGNED primitive is below threshold. Under a frozen
+    checkpoint nearest-center assignment of point i IS Gaussian i, so this reduces to their rule
+    exactly; off frozen it is the only reading that stays faithful to the intent ("the geometry
+    covering this point is transparent, so do not score it").
+
+    A point owned by NO primitive keeps its GT label and scores as a miss -- masking it would let
+    a method silently delete the points it fails to cover, which is a much bigger loophole than
+    the one the threshold itself opens (see the caveat printed below).
+    """
+    if primitive_alpha is None:
+        return gt_labels_remapped, None
+    gt = gt_labels_remapped.copy()
+    owned = assigned >= 0
+    low = np.zeros(gt.shape[0], dtype=bool)
+    low[owned] = primitive_alpha[assigned[owned]] < threshold
+    scored_before = int((gt != 0).sum())
+    gt[low] = 0
+    dropped = scored_before - int((gt != 0).sum())
+    frac = dropped / max(scored_before, 1) * 100
+    print(f"[{tag}] GT opacity mask: {dropped}/{scored_before} labelled points dropped "
+          f"({frac:.2f}%) at alpha < {threshold}")
+    return gt, {"dropped": dropped, "scored_before": scored_before, "dropped_pct": frac}
+
+
 def evaluate_powerfoam(gt_points, gt_labels_remapped, num_classes, target_names, device,
-                        checkpoint_dir, solved_features_path):
+                        checkpoint_dir, solved_features_path,
+                        gt_opacity_mask=False, opacity_threshold=0.1, foam_alpha_length=None):
     import warp as wp
     import configargparse
     from configs import Params, add_group
@@ -156,6 +192,21 @@ def evaluate_powerfoam(gt_points, gt_labels_remapped, num_classes, target_names,
     owned = assigned >= 0
     pred_labels[owned] = primitive_class[assigned[owned]] + 1  # -> 1..K label space
 
+    if gt_opacity_mask:
+        # NO DIRECT ANALOGUE OF sigmoid(opacity). A Gaussian's opacity is a sigmoid, so it is
+        # already a per-primitive alpha in (0,1) and 0.1 means "one tenth opaque". The foam stores
+        # an unbounded volumetric DENSITY (exp / softplus, scene.py:312-313); alpha only exists
+        # once a ray path length is fixed, via alpha = 1 - exp(-density * L). We take L as the
+        # cell's own radius scale so the quantity is "how opaque is this cell to a ray crossing
+        # it", which is the closest thing to what the Gaussian threshold measures. L is
+        # configurable because this choice, unlike the Gaussian side, is OURS and not the
+        # protocol's -- any number reported under it must say so.
+        density = model.get_density().detach().float().cpu().numpy().reshape(-1)
+        L = float(foam_alpha_length) if foam_alpha_length else radii.reshape(-1) * 2.0
+        alpha = 1.0 - np.exp(-density * L)
+        gt_labels_remapped, _ = apply_gt_opacity_mask(
+            gt_labels_remapped, assigned, alpha, opacity_threshold, "powerfoam")
+
     gt_t = torch.from_numpy(gt_labels_remapped).long()
     pred_t = torch.from_numpy(pred_labels).long()
     return calculate_metrics(gt_t, pred_t, num_classes + 1)
@@ -180,7 +231,8 @@ def load_gaussian_means_opacities(gaussian_ckpt_path, device):
 
 
 def evaluate_splat_feature_solver(gt_points, gt_labels_remapped, num_classes, target_names, device,
-                                   gaussian_ckpt_path, solved_features_path, opacity_threshold=0.1):
+                                   gaussian_ckpt_path, solved_features_path, opacity_threshold=0.1,
+                                   gt_opacity_mask=False):
     means, opacities = load_gaussian_means_opacities(gaussian_ckpt_path, device)
     valid_mask = opacities >= opacity_threshold
     print(f"[splat-feature-solver] {means.shape[0]} gaussians, {valid_mask.sum()} valid (opacity>={opacity_threshold})")
@@ -191,10 +243,22 @@ def evaluate_splat_feature_solver(gt_points, gt_labels_remapped, num_classes, ta
     text_feats = embed_class_names(target_names, device)
     primitive_class = classify_primitives(primitive_features, text_feats).cpu().numpy()
 
-    assigned = assign_points_to_nearest_center(gt_points, means, valid=valid_mask)
+    # THE TWO OPACITY RULES ARE MUTUALLY EXCLUSIVE, and composing them would silently no-op.
+    # Our default drops low-opacity Gaussians from the CANDIDATE SET, so the point is still
+    # scored but is assigned to the nearest surviving Gaussian. OpenGaussian instead keeps every
+    # Gaussian eligible and deletes the POINT. If we filtered candidates first, `assigned` could
+    # never reference a low-opacity Gaussian and the GT mask below would drop exactly zero points
+    # -- looking like agreement while doing nothing. So under --gt-opacity-mask we hand the full
+    # set to the assignment, exactly as they do.
+    assigned = assign_points_to_nearest_center(
+        gt_points, means, valid=None if gt_opacity_mask else valid_mask)
     pred_labels = np.zeros(gt_points.shape[0], dtype=np.int64)
     owned = assigned >= 0
     pred_labels[owned] = primitive_class[assigned[owned]] + 1
+
+    if gt_opacity_mask:
+        gt_labels_remapped, _ = apply_gt_opacity_mask(
+            gt_labels_remapped, assigned, opacities, opacity_threshold, "splat-feature-solver")
 
     gt_t = torch.from_numpy(gt_labels_remapped).long()
     pred_t = torch.from_numpy(pred_labels).long()
@@ -333,6 +397,8 @@ def main(args):
         ious, miou, acc, macc = evaluate_powerfoam(
             gt_points, gt_labels_remapped, num_classes, target_names, device,
             args.powerfoam_checkpoint, args.powerfoam_features,
+            gt_opacity_mask=args.gt_opacity_mask, opacity_threshold=args.opacity_threshold,
+            foam_alpha_length=args.foam_alpha_length,
         )
         print(f"\n[PowerFoam] mIoU={miou:.4f} mAcc={macc:.4f} overall_acc={acc:.4f}")
         for i, name in enumerate(target_names):
@@ -346,6 +412,7 @@ def main(args):
         ious, miou, acc, macc = evaluate_splat_feature_solver(
             gt_points, gt_labels_remapped, num_classes, target_names, device,
             args.gaussian_checkpoint, args.gaussian_features,
+            opacity_threshold=args.opacity_threshold, gt_opacity_mask=args.gt_opacity_mask,
         )
         print(f"\n[Splat Feature Solver] mIoU={miou:.4f} mAcc={macc:.4f} overall_acc={acc:.4f}")
         for i, name in enumerate(target_names):
@@ -372,6 +439,15 @@ if __name__ == "__main__":
                     help="Which Pointcept label file to use when --gt-format scannet: 'segment20' "
                     "(official 20-class ScanNet benchmark labels, default) or 'segment200'.")
     p.add_argument("--method", choices=["powerfoam", "splat_feature_solver", "both"], default="both")
+    p.add_argument("--gt-opacity-mask", action="store_true",
+                   help="Replicate OpenGaussian eval_scannet.py:127-129 -- zero the GT label of "
+                        "points whose assigned primitive is below --opacity-threshold, deleting "
+                        "them from the metric. OFF by default: it changes the SCORED POINT SET "
+                        "per method, so numbers with and without it are not comparable.")
+    p.add_argument("--opacity-threshold", type=float, default=0.1)
+    p.add_argument("--foam-alpha-length", type=float, default=None,
+                   help="Fixed path length L for the foam's alpha = 1 - exp(-density*L). "
+                        "Default: the cell's own 2*radius.")
     p.add_argument("--classes", default="coarse",
                     help="'coarse' (default, see COARSE_CLASS_NAMES), 'opengaussian19'/'opengaussian15'/"
                     "'opengaussian10' (OpenGaussian's own exact NYU40 class subsets, for a literal "
