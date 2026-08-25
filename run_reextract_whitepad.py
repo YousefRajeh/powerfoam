@@ -32,14 +32,23 @@ EXTRACT = r"D:\Downloads\splat-distiller\feature_extractor.py"
 SAM_CKPT = r"D:\Downloads\powerfoam\checkpoints\sam_vit_h_4b8939.pth"
 DATA = r"D:\Downloads\powerfoam\data\scannet"
 
-# ALL 10 SCENES. Ordered SMALLEST FIRST so the cheap scenes land early and can be evaluated
-# while the large ones are still extracting -- scene0347_00 (54 imgs) has every comparison
-# artifact already, so it gives the first read on whether the white-pad fix moves mIoU.
-# Cost note: a 1-image shard measured 178 s, but that INCLUDES the one-time SAM ViT-H (2.4 GB)
-# + CLIP model load and ran against a busy GPU, so it is an overestimate of the marginal rate.
-# 1,158 images total across the 10 scenes.
-SCENES = ["scene0062_00", "scene0097_00", "scene0200_00", "scene0347_00", "scene0400_00",
-          "scene0070_00", "scene0590_00", "scene0140_00", "scene0645_00", "scene0000_00"]
+# ALL 10 SCENES, HARDEST FIRST. scene0062_00 leads only because it is already extracted and
+# is the reproduction check against the measured 34.71/34.71/50.65. After it come the scenes
+# that would FALSIFY the black-fill result soonest: scene0347/0070/0140 are where
+# coherence-gated geodesic growing collapsed (1.84 / 0.42 / 3.67 mIoU against a ~40 baseline),
+# and 0645/0590 carry the lowest baseline mIoU (28.40 / 35.54) with the largest cell counts
+# (352k / 223k), stressing memory and clustering together.
+#
+# Smallest-first was the previous order and it is actively misleading here: it would finish
+# the four cheapest scenes first and build a running average out of the easiest cases. A
+# +1.75 mIoU pilot on scene0000_00 once reversed to -12.3 over ten scenes.
+#
+# KILL CRITERION for the black-fill (protocol) change: it is winning on scene0062_00 by +7.4
+# to +12.2 with 6/6 cells positive. If the running mean over the first FOUR hardest scenes is
+# not clearly above the white-fill baseline, stop and re-examine rather than extracting the
+# remaining six. 1,158 images total.
+SCENES = ["scene0062_00", "scene0347_00", "scene0070_00", "scene0140_00", "scene0645_00",
+          "scene0590_00", "scene0000_00", "scene0097_00", "scene0200_00", "scene0400_00"]
 
 
 def local_gpu_busy():
@@ -65,6 +74,10 @@ def main():
                    help="Pixels inside the bbox but outside the mask. 0 = LangSplat/OpenGaussian.")
     p.add_argument("--pad", type=int, default=0,
                    help="Square-padding around the crop. 0 = LangSplat/OpenGaussian.")
+    p.add_argument("--scenes", default="",
+                   help="Comma-separated subset to extract. Use this to PARTITION work "
+                        "between the local box and the remote GPUs -- two runners walking the "
+                        "same list would both start the same scene into the same folder.")
     p.add_argument("--only-level", default="l",
                    help="Generate ONLY this SAM granularity ('l'=whole-object, the level we "
                         "score). Skips postprocessing for the levels we never read; measured "
@@ -109,7 +122,9 @@ def main():
     env["PYTHONPATH"] = (r"D:\Downloads\splat-distiller;"
                           r"D:\Downloads\splat-distiller\submodules\segment-anything-langsplat")
 
-    for s in SCENES:
+    todo = [x for x in (a.scenes.split(",") if a.scenes else SCENES) if x]
+    print(f"[plan] {len(todo)} scene(s): {', '.join(todo)}", flush=True)
+    for s in todo:
         src = os.path.join(DATA, f"{s}_colmap")
         done = os.path.join(src, a.out_name)
         # The extractor emits TWO files per image (`{idx}_f.npy` features, `{idx}_s.npy` seg),

@@ -43,3 +43,4 @@ configs/_tf_*.yaml
 
 # Orchestration scripts are versioned deliberately; scratch *.sh above stays ignored.
 !scripts/remote/*.sh
+/recon_remote
