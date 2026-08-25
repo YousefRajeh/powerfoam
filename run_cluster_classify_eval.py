@@ -118,7 +118,17 @@ def main():
     device = "cuda"
     results = {m: {cs: {} for cs in CLASS_SETS} for m in ("feat_kmeans320", "pos_aware_64x5")}
 
-    for scene, split in SCENES.items():
+    # ONLY_SCENES restricts the sweep to a comma-separated subset, for A/B-ing a feature
+    # construction on one scene before paying for all ten. A single-scene delta is a PILOT,
+    # never a conclusion -- eleven single-scene results in this project have reversed at
+    # 10-scene scale, most recently hubness (+9.6 on one scene, -5.6 across ten).
+    suffix = os.environ.get("FEAT_SUFFIX", "_l3")   # also read per-scene below; hoisted so the
+                                                    # summary filename is defined even if the
+                                                    # scene loop selects nothing.
+    only = [s for s in os.environ.get("ONLY_SCENES", "").split(",") if s]
+    scenes = {k: v for k, v in SCENES.items() if k in only} if only else SCENES
+
+    for scene, split in scenes.items():
         ckpt_dir = f"output/scannet_{scene}_nonfrozen"
         # SUFFIX selects which SAM-level construction to score. Default '' is the all-levels
         # normalized sum (splat-distiller/NormLift's construction); '_l3' is level-3 (large)
@@ -173,7 +183,11 @@ def main():
                 results[method][cs][scene] = {"mIoU": miou, "mAcc": macc, "overall_acc": acc}
                 print(f"  {cs} {method}: mIoU={miou:.4f} mAcc={macc:.4f}", flush=True)
 
-    print("\n\n=== 10-scene averages (nonfrozen, geometric-median) ===")
+    n_scenes = len(scenes)
+    tag = "10scene" if n_scenes == len(SCENES) else f"{n_scenes}scene_" + "_".join(scenes)
+    print(f"\n\n=== {n_scenes}-scene average"
+          f"{'s' if n_scenes > 1 else ' (PILOT -- not a conclusion)'}"
+          f" (nonfrozen, geometric-median), features='{suffix or 'all-levels'}' ===")
     print("baseline per-primitive: 19cls 30.98/59.99  15cls 30.98/60.70  10cls 34.10/65.23")
     summary = {}
     for method, per_cs in results.items():
@@ -191,7 +205,10 @@ def main():
             line.append(f"{cs} {np.mean(mious)*100:.2f}/{np.mean(maccs)*100:.2f}")
         print("  ".join(line))
 
-    out = "artifacts/scannet/cluster_classify_10scene_avg.json"
+    # Filename carries the scene set AND the feature suffix. A single-scene ONLY_SCENES run
+    # previously overwrote the real ten-scene artifact with a one-scene number still labelled
+    # "10-scene averages", which is exactly how a pilot gets mistaken for a confirmed result.
+    out = f"artifacts/scannet/cluster_classify_{tag}_avg{suffix}.json"
     with open(out, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\nWrote {out}")

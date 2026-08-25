@@ -80,6 +80,18 @@ def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, h
         # large-level mask"; NormLift (per its author) likewise uses the l-level. Summing
         # all 4 levels per pixel (the splat-distiller loader default) blends up to 4 mask
         # embeddings per pixel -- the measured feature-contamination source.
+        # LOUD bounds check. Python slicing is forgiving: on a single-level artifact (one row
+        # in _s.npy, as written by SAM_ONLY_LEVEL extraction) `segment[3:4]` yields an EMPTY
+        # tensor rather than raising, which would silently lift zero features for every view
+        # and produce a plausible-looking all-background result. Fail instead.
+        n_lvl = segment.shape[0]
+        wanted = sam_level if isinstance(sam_level, list) else [sam_level]
+        if any(i >= n_lvl for i in wanted):
+            raise IndexError(
+                f"--sam-level {sam_level} requested but {segment_path} has only {n_lvl} "
+                f"level(s). A single-level artifact (SAM_ONLY_LEVEL extraction) stores the "
+                f"chosen granularity at index 0, so pass --sam-level 0 for it; passing 3 "
+                f"would silently select nothing.")
         segment = segment[sam_level] if isinstance(sam_level, list) else segment[sam_level:sam_level + 1]
     zero_row = torch.zeros(1, 512, device=features.device, dtype=features.dtype)
     features_pad = torch.cat([zero_row, features], dim=0)
