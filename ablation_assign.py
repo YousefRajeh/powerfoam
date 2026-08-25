@@ -8,17 +8,14 @@ EACH REPRESENTATION GETS ITS OWN NATURAL QUERY -- no reimplemented math on eithe
                               cells and nearest-centre IS the exact cell membership. Proven in
                               test_unweighted_delaunay_adjacency.py T3 (0/5000 disagreements
                               against the power-cell query at r=0).
-  gaussian   Mahalanobis:     argmin_i (x-mu_i)^T Sigma_i^-1 (x-mu_i) + log|Sigma_i|
+  gaussian   Mahalanobis:     argmin_i (x-mu_i)^T Sigma_i^-1 (x-mu_i)   -- see ablation_maha
                               A Gaussian has no disjoint cell, so nearest-CENTRE ignores that
                               an anisotropic splat extends much further along its long axis
-                              than its short one. Mahalanobis asks "which Gaussian most
-                              plausibly generated this point", which is the natural query for
-                              the representation. The +log|Sigma| term is what makes it a
-                              likelihood comparison rather than a per-Gaussian-rescaled
-                              distance: without it, a Gaussian can always win simply by being
-                              large, since inflating Sigma shrinks every Mahalanobis distance.
-                              (Equivalently: argmax of the un-normalised Gaussian log-density,
-                              dropping the constant 3*log(2*pi).)
+                              than its short one. Computed EXACTLY (no kNN candidate set: on
+                              real checkpoints kNN disagrees with the exhaustive argmin on
+                              11-50% of points) and WITHOUT a +log|Sigma| term (real
+                              checkpoints contain zero-scale Gaussians, whose log|Sigma| is
+                              -inf, and one such sliver would win every point in the scene).
 
 The assignment is written ONCE per (scene, recon) and every downstream ablation cell reads
 the stored array, so the correspondence cannot drift between methods within a scene.
@@ -59,12 +56,14 @@ def load_primitives(recon, scene, device="cuda"):
 
     if kind in ("powerfoam", "radfoam"):
         # radfoam checkpoints carry `primal_points`/`points`; powerfoam uses `points`+`radii`.
-        pts = sd.get("points", sd.get("primal_points"))
+        # radfoam checkpoints store sites under `xyz`; powerfoam uses `points`.
+        pts = None
+        for k in ("points", "xyz", "primal_points", "means"):
+            if k in sd and sd[k] is not None:
+                pts = sd[k]
+                break
         if pts is None:
-            for k in ("primal_points", "points", "means"):
-                if k in sd:
-                    pts = sd[k]
-                    break
+            raise KeyError(f"no point tensor in checkpoint; keys={list(sd)}")
         pts = torch.as_tensor(pts).float()
         if kind == "powerfoam":
             # PowerfoamScene.get_radii() is softplus(raw, beta=100)
@@ -95,49 +94,23 @@ def _quat_to_R(q):
     ], dim=-2)
 
 
-def assign_mahalanobis(points, means, scales, quats, k=32, chunk=200_000, device="cuda"):
-    """argmin_i (x-mu_i)^T Sigma_i^-1 (x-mu_i) + log|Sigma_i|, restricted to the k nearest
-    centres per point.
-
-    The kNN restriction is what makes this tractable at 10^5 points x 10^6 Gaussians. It is a
-    genuine approximation: a distant, hugely elongated Gaussian could in principle win on
-    Mahalanobis distance while not being among the k nearest by Euclidean distance. k=32 is
-    generous relative to the anisotropy actually present (gsplat's scales rarely span more
-    than ~1-2 orders of magnitude), and the chosen k is recorded so the assumption is
-    auditable rather than hidden.
-
-    Sigma = R diag(s^2) R^T, so Sigma^-1 = R diag(s^-2) R^T and the quadratic form is
-    sum_j ((R^T d)_j / s_j)^2 -- computed without ever forming a 3x3 inverse.
-    """
-    P = points.shape[0]
-    R = _quat_to_R(quats)                                    # (N,3,3)
-    logdet = 2.0 * torch.log(scales.clamp_min(1e-12)).sum(-1)  # log|Sigma| = 2*sum log s
-    out = torch.full((P,), -1, dtype=torch.long, device=device)
-
-    for s0 in range(0, P, chunk):
-        x = points[s0:s0 + chunk].to(device)                 # (C,3)
-        d = torch.cdist(x, means)                            # (C,N) euclidean
-        kk = min(k, means.shape[0])
-        nn = d.topk(kk, largest=False).indices               # (C,k)
-        diff = x[:, None, :] - means[nn]                     # (C,k,3)
-        # local = R_i^T diff, then scale-normalise
-        local = torch.einsum("ckij,cki->ckj", R[nn], diff)    # (C,k,3)
-        m2 = ((local / scales[nn].clamp_min(1e-12)) ** 2).sum(-1)   # (C,k)
-        score = m2 + logdet[nn]
-        out[s0:s0 + chunk] = nn.gather(1, score.argmin(1, keepdim=True)).squeeze(1)
-    return out
-
-
-def compute_assignment(recon, scene, gt_points, device="cuda", knn_k=32):
+def compute_assignment(recon, scene, gt_points, device="cuda", progress=None):
     """-> (assignment int64 (P,), method str, seconds float). -1 means unowned."""
     from point_cloud_query import assign_points_to_power_cells
+
+    from ablation_maha import assign_exact, prepare
 
     t0 = time.time()
     prim = load_primitives(recon, scene, device=device)
     if prim["kind"] == "gaussian":
-        a = assign_mahalanobis(torch.as_tensor(gt_points).float(), prim["centers"],
-                               prim["scales"], prim["quats"], k=knn_k, device=device)
-        return a.cpu().numpy(), "mahalanobis", time.time() - t0
+        # prepare() re-exponentiates, so hand it the LOG scales the checkpoint stored.
+        means, scales, R, _extent, _ndeg = prepare(
+            prim["centers"].cpu(), torch.log(prim["scales"].cpu().clamp_min(1e-30)),
+            prim["quats"].cpu())
+        idx, _ = assign_exact(torch.as_tensor(gt_points).float(), means.to(device),
+                              scales.to(device), R.to(device), device=device,
+                              progress=progress)
+        return idx.cpu().numpy(), "mahalanobis", time.time() - t0
 
     centers = prim["centers"].cpu().numpy().astype(np.float64)
     radii = prim["radii"].cpu().numpy().astype(np.float64)
