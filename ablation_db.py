@@ -88,6 +88,14 @@ CREATE TABLE IF NOT EXISTS solves (
     features     TEXT NOT NULL,        -- feature artifact tag, e.g. ogl3
     solver       TEXT NOT NULL,        -- geometric_median|weighted|ridge|inverse_variance|consensus
     n_valid      INTEGER,
+    n_primitives INTEGER,
+    -- Fraction of primitives that accumulated ZERO weight across every view, i.e. cells no
+    -- camera can see. Measured 6.03% on scene0062_00 pf_nonfroz, of which 95.5% lie INSIDE
+    -- the reconstructed volume -- object interiors and the far side of walls, not floaters.
+    -- This is a property of the reconstruction and the capture trajectory, not of how many
+    -- views were lifted (all of them are). It differs per representation, so it belongs in
+    -- the results table as a reported column rather than buried in a scoring convention.
+    frac_unobserved REAL,
     path         TEXT NOT NULL,
     seconds      REAL,
     created_at   REAL,
@@ -110,6 +118,17 @@ CREATE TABLE IF NOT EXISTS results (
     macc          REAL,
     overall_acc   REAL,
     per_class     TEXT,                -- JSON {class_name: iou}
+    -- Semantic-surface metrics (ablation_surface.py). mIoU counts points and cannot tell a
+    -- slightly-wrong-sized region from one on the far side of the room; these measure the
+    -- DISTANCE between the predicted and true regions of the same cloud. Metres.
+    -- A low scd with a low mIoU means errors are boundary slop, not teleported regions.
+    scd           REAL,                -- semantic Chamfer-L1, mean over scored classes
+    mae_pred2gt   REAL,                -- false-positive depth
+    mae_gt2pred   REAL,                -- false-negative depth
+    hd95          REAL,                -- outlier-trimmed worst case
+    boundary_f1   REAL,                -- F1 under "nearest same-class point within 2cm"
+    n_missed      INTEGER,             -- classes present in GT but never predicted; read
+                                       -- WITH the distances, which exclude them
     seconds       REAL,
     created_at    REAL,
     UNIQUE (scene, recon, features, solver, grouping, class_set)
@@ -167,13 +186,17 @@ def have_result(con, scene, recon, features, solver, grouping, class_set):
 
 
 def put_result(con, run_id, scene, recon, features, solver, grouping, complex_, class_set,
-               n_classes, miou, macc, acc, per_class, seconds):
+               n_classes, miou, macc, acc, per_class, seconds, surface=None):
+    sf = surface or {}
     con.execute(
         "INSERT OR REPLACE INTO results (run_id,scene,recon,features,solver,grouping,complex,"
-        "class_set,n_classes,miou,macc,overall_acc,per_class,seconds,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "class_set,n_classes,miou,macc,overall_acc,per_class,scd,mae_pred2gt,mae_gt2pred,"
+        "hd95,boundary_f1,n_missed,seconds,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (run_id, scene, recon, features, solver, grouping, complex_, class_set, n_classes,
-         miou, macc, acc, json.dumps(per_class), seconds, time.time()))
+         miou, macc, acc, json.dumps(per_class), sf.get("scd"), sf.get("mae_pred2gt"),
+         sf.get("mae_gt2pred"), sf.get("hd95"), sf.get("boundary_f1"), sf.get("n_missed"),
+         seconds, time.time()))
     con.commit()
 
 
