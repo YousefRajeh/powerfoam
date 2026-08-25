@@ -48,9 +48,13 @@ SCENES = ["scene0062_00", "scene0097_00", "scene0200_00", "scene0347_00", "scene
 def local_gpu_busy():
     """True while a PowerFoam training run still holds the local GPU."""
     try:
-        out = subprocess.run(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+        # NOT --query-compute-apps: on Windows that lists desktop/graphics processes too (22 of
+        # them here, all with [N/A] memory), so it never reports idle and the wait never ends.
+        # Total used memory is the reliable signal -- an idle desktop sits near 1.7 GB, while a
+        # PowerFoam training run holds 4-8 GB.
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
                              capture_output=True, text=True, timeout=60).stdout.strip()
-        return bool(out)
+        return int(out.split()[0]) > 3000
     except Exception:
         return False
 
@@ -61,6 +65,21 @@ def main():
                    help="Block until the local GPU is free before extracting.")
     p.add_argument("--poll", type=int, default=300)
     a = p.parse_args()
+
+    # SINGLE INSTANCE. Three copies of this script were once alive at the same time, all
+    # walking the same scene list into the same folder and each truncating the others'
+    # per-scene logs -- which is how a run that died at 85% got recorded as `rc=0` in 6.1 min.
+    # An exclusive create fails if another runner holds the lock.
+    lock = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".reextract_whitepad.lock")
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        print(f"[ABORT] another runner holds {lock}; delete it if that runner is dead.")
+        return 1
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+    import atexit
+    atexit.register(lambda: os.path.exists(lock) and os.remove(lock))
 
     if a.wait:
         print(f"[wait] holding until the local GPU frees up ...", flush=True)
@@ -76,14 +95,26 @@ def main():
     for s in SCENES:
         src = os.path.join(DATA, f"{s}_colmap")
         done = os.path.join(src, OUT_NAME)
-        if os.path.isdir(done) and len(os.listdir(done)) > 4:
-            print(f"[SKIP] {s} ({len(os.listdir(done))} files present)", flush=True)
+        # The extractor emits TWO files per image (`{idx}_f.npy` features, `{idx}_s.npy` seg),
+        # so completeness is 2*n_images. The old `> 4` guard would have accepted a run that
+        # died at 85% as finished and silently skipped re-doing it.
+        n_img = len(os.listdir(os.path.join(src, "images")))
+        have = len(os.listdir(done)) if os.path.isdir(done) else 0
+        if have >= 2 * n_img:
+            print(f"[SKIP] {s} (complete: {have}/{2 * n_img})", flush=True)
             continue
+        if have:
+            print(f"[REDO] {s} (partial: {have}/{2 * n_img})", flush=True)
         t0 = time.time()
         print(f"[START] {s} {time.strftime('%H:%M:%S')}", flush=True)
+        # ABSOLUTE path. `feature_extractor.py:241` uses `--ouput-dir` verbatim as the output
+        # path, so a bare folder name resolves against the CWD -- every scene then writes into
+        # ONE shared directory, and because the files are named by frame index (`4840_f.npy`)
+        # and ScanNet frame indices repeat across scenes, the scenes silently overwrite each
+        # other. The first run of this script lost its output exactly that way.
         r = subprocess.run(
             [PY, EXTRACT, "-s", src, "--model", "SAMOpenCLIP",
-             "--ouput-dir", OUT_NAME, "--sam_ckpt_path", SAM_CKPT, "--device", "cuda"],
+             "--ouput-dir", done, "--sam_ckpt_path", SAM_CKPT, "--device", "cuda"],
             env=env, stdout=open(f"logs_reextract_{s}.log", "w"), stderr=subprocess.STDOUT)
         print(f"[DONE ] {s} rc={r.returncode} {(time.time()-t0)/60:.1f} min", flush=True)
     print("[ALL DONE]", flush=True)
