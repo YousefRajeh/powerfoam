@@ -197,10 +197,28 @@ def run_scene(con, run_id, scene, recons, log):
                     gt_t = torch.from_numpy(remap_gt_labels(raw_labels, tids)).long()
                     text = embed_class_names(tnames, "cuda")
                     cls_v = pool_classify_broadcast(labels, unit, nlab, text).cpu().numpy()
+                    # A primitive with no lifted features cannot be classified. Leaving its
+                    # points at prim_cls=0 would emit class 1 after the +1 shift, i.e. silently
+                    # predict the FIRST class for every such point -- 7.07% of GT points on
+                    # scene0062_00 pf_nonfroz, all becoming false positives for one class.
+                    # They are marked 0 = "no prediction" instead, which the metric treats as
+                    # unpredicted: it costs those points' true classes recall, without
+                    # fabricating precision errors for an unrelated class.
+                    #
+                    # NOTE this differs from run_cluster_classify_eval.py, which reassigns such
+                    # points to the nearest VALID primitive. That convention gives every point
+                    # a prediction, but makes the correspondence depend on valid_mask, hence on
+                    # the solver -- so it cannot be the single stored assignment shared across
+                    # the ablation. The two differ by 0.65 mIoU on scene0062_00 (34.66 vs
+                    # 35.31); the convention is recorded per row via the `grouping` provenance.
+                    prim_valid = np.zeros(n_prim, dtype=bool)
+                    prim_valid[vidx] = True
                     prim_cls = np.zeros(n_prim, dtype=np.int64)
                     prim_cls[vidx] = cls_v
                     pred = np.zeros(len(gt_points), dtype=np.int64)
-                    pred[owned] = prim_cls[assigned[owned]] + 1
+                    scorable = owned.copy()
+                    scorable[owned] = prim_valid[assigned[owned]]
+                    pred[scorable] = prim_cls[assigned[scorable]] + 1
                     ious, miou, acc, macc = calculate_metrics(
                         gt_t, torch.from_numpy(pred).long(), len(tnames) + 1)
                     per_class = {tnames[c - 1]: float(ious[c]) for c in range(1, len(tnames) + 1)}
