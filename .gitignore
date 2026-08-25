@@ -40,3 +40,6 @@ smoke_whitepad/
 smoke6/
 configs/_tf_*.yaml
 .reextract_whitepad.lock
+
+# Orchestration scripts are versioned deliberately; scratch *.sh above stays ignored.
+!scripts/remote/*.sh

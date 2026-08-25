@@ -1,0 +1,2 @@
+# Shell scripts run on the Linux remote; never check them out with CRLF.
+*.sh text eol=lf
