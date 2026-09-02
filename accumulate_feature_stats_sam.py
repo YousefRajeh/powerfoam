@@ -23,6 +23,8 @@ import torch.nn.functional as F
 import configargparse
 import warp as wp
 
+SPLIT = "all"
+
 from configs import Params, add_group
 from data_loader import DataHandler
 from powerfoam.scene import PowerfoamScene
@@ -121,7 +123,9 @@ def load_image_feature_from_SAMOpenCLIP(feature_folder: Path, image_stem: str, h
 
 def main(scene: str, config_path: str, feature_folder: str, output_path: str, batch_size: int = 1,
          images_subdir: str = "images", feature_name_format: str = None, sam_level=None, skip_normalize: bool = False,
-         weight_transform=None):
+         weight_transform=None, split: str = "all"):
+    global SPLIT
+    SPLIT = split
     wp.init()
     parser = configargparse.ArgParser()
     add_group(parser, Params)
@@ -130,7 +134,13 @@ def main(scene: str, config_path: str, feature_folder: str, output_path: str, ba
 
     checkpoint = config_path.replace("/config.yaml", "").replace("\\config.yaml", "")
     data_handler = DataHandler(args)
-    data_handler.reload("all", downsample=args.downsample[-1])
+    # SPLIT. OpenGaussian trains (and therefore lifts) with `--eval`, i.e. on the train split
+    # only, holding out every 8th view; their 3D evaluation then scores the FULL GT point cloud
+    # regardless (`eval_scannet.py` reads the whole labels.ply with no visibility filter). So
+    # lifting from "all" gives us ~12% more observations per cell than any baseline had, while
+    # scoring the same target -- an advantage we were taking silently. `--split train` matches
+    # their condition; the split rule is identical in both codebases (indices % 8 == 0 -> test).
+    data_handler.reload(SPLIT, downsample=args.downsample[-1])
 
     model = PowerfoamScene(args)
     model.initialize_from_dataset(data_handler, device="cuda")
@@ -164,6 +174,17 @@ def main(scene: str, config_path: str, feature_folder: str, output_path: str, ba
         # sorted(os.listdir(images_dir)) used to build every other manifest in this project).
         images_dir = Path(args.data_path) / args.scene / images_subdir
         image_names = sorted(p.stem for p in images_dir.iterdir())
+        # SPLIT ALIGNMENT. `cameras` comes from the DataHandler and is already filtered by the
+        # split; this directory listing is not. Under --split train the two lengths disagree
+        # (37 names vs 32 cameras on scene0062_00) and the assert below fires -- which is the
+        # good outcome. The dangerous one would be silently zipping name i to camera i, feeding
+        # every view the WRONG image's features. colmap.py's rule is `indices % 8 != 0` on the
+        # sorted name order, so applying it to this same sorted list reproduces the exact
+        # filtering the DataHandler did.
+        if SPLIT == "train":
+            image_names = [n for i, n in enumerate(image_names) if i % 8 != 0]
+        elif SPLIT == "test":
+            image_names = [n for i, n in enumerate(image_names) if i % 8 == 0]
     assert len(image_names) == len(cameras), f"{len(image_names)} images vs {len(cameras)} cameras"
 
     feature_dir = Path(feature_folder)
@@ -204,9 +225,12 @@ if __name__ == "__main__":
                         "already uses); keeps soft weights in front of it")
     p.add_argument("--skip-normalize", action="store_true",
                    help="Do NOT L2-normalize the per-pixel feature; keeps multi-level agreement as a magnitude/confidence weight.")
+    p.add_argument("--split", default="all", choices=["all", "train"],
+                   help="Views to lift from. 'train' = i%%8 != 0, matching OpenGaussian's "
+                        "--eval condition; 'all' uses every view (our previous default).")
     p.add_argument("--sam-level", type=str, default=None,
                    help="use only this SAM granularity level (3 = whole/l-level, the "
                         "OpenGaussian/NormLift convention); default sums all levels")
     cli_args = p.parse_args()
     main(cli_args.scene, cli_args.config, cli_args.feature_folder, cli_args.output, cli_args.batch_size,
-         images_subdir=cli_args.images_subdir, feature_name_format=cli_args.feature_name_format, sam_level=cli_args.sam_level, weight_transform=cli_args.weight_transform, skip_normalize=cli_args.skip_normalize)
+         images_subdir=cli_args.images_subdir, feature_name_format=cli_args.feature_name_format, sam_level=cli_args.sam_level, weight_transform=cli_args.weight_transform, skip_normalize=cli_args.skip_normalize, split=cli_args.split)

@@ -56,8 +56,17 @@ def train(args):
     test_split = "test" if args.eval else "all"
     test_data_handler = DataHandler(args)
     test_data_handler.reload(test_split, downsample=args.downsample[-1])
-    train_data_handler = DataHandler(args)
-    train_data_handler.reload(train_split, downsample=args.downsample[0])
+    # With `eval: false` both splits are "all", so the two handlers would otherwise decode and
+    # hold a SECOND, byte-identical copy of the entire image set. On the 733-view ScanNet++ scene
+    # that second copy is ~20 GB and was enough on its own to exceed the job's memory limit.
+    # Sharing is only safe when the reload at the downsample switch below cannot make the two
+    # diverge, i.e. when every entry of `downsample` is the same value.
+    share_handler = train_split == test_split and len(set(args.downsample)) == 1
+    if share_handler:
+        train_data_handler = test_data_handler
+    else:
+        train_data_handler = DataHandler(args)
+        train_data_handler.reload(train_split, downsample=args.downsample[0])
     train_data_iter = train_data_handler.get_iter()
     print("Loaded dataset")
 
@@ -67,6 +76,57 @@ def train(args):
     model.declare_optimizers(args, args.iterations)
     model.sort_points()
     args.init_points = model.points.shape[0]
+
+    # ---- resume -------------------------------------------------------------------------
+    # Order matters. load_pt restores the geometry AT THE POINT COUNT REACHED (densification
+    # changes it every 100 iters), so the optimizer must be re-declared against the restored
+    # tensors before its state is loaded, or the Adam moments have the wrong shape.
+    # args.init_points must also be restored to its ORIGINAL value: the densification target is
+    # init_points * a**(i - densify_from), so seeding it with the resumed count would collapse
+    # the growth schedule.
+    start_iter = 0
+    state_path = None if getattr(args, "dry_run", False) else f"{out_dir}/train_state.pt"
+    if getattr(args, "resume", False) and state_path and os.path.exists(state_path):
+        st = torch.load(state_path, map_location="cuda", weights_only=False)
+        model.load_pt(f"{out_dir}/model.pt")
+        model.declare_optimizers(args, args.iterations)
+        # Adam does NOT validate shapes in load_state_dict -- it stores whatever it is given and
+        # only fails later inside _foreach_lerp_ on the first step(), far from the cause. So the
+        # try/except below cannot catch a stale-moment mismatch and the shapes must be checked here.
+        #
+        # WHY A MISMATCH HAPPENS AT ALL: model.pt and train_state.pt are two separate writes, so a
+        # crash BETWEEN them (995 ran out of disk mid-checkpoint) leaves geometry from iteration i
+        # beside optimizer moments from i-k. Densification changed the point count in between, so
+        # the moments index a different number of primitives (582,634 vs 602,803 on 3db0a1c8f3).
+        # Fresh moments cost a few hundred iterations of Adam warm-up; refusing to resume costs the
+        # whole run, so we drop the state and continue.
+        def _moments_fit(sd):
+            ps = [p for g in model.optimizer.param_groups for p in g["params"]]
+            for k, s in (sd.get("state") or {}).items():
+                try:
+                    p = ps[int(k)]
+                except (ValueError, IndexError):
+                    return False
+                for m in ("exp_avg", "exp_avg_sq"):
+                    t = s.get(m)
+                    if torch.is_tensor(t) and tuple(t.shape) != tuple(p.shape):
+                        return False
+            return True
+
+        try:
+            if _moments_fit(st["optimizer"]):
+                model.optimizer.load_state_dict(st["optimizer"])
+            else:
+                print("[resume] optimizer moments do not match the restored geometry "
+                      "(interrupted checkpoint); continuing with fresh moments")
+        except (ValueError, KeyError) as e:
+            print(f"[resume] optimizer state rejected ({e}); continuing with fresh moments")
+        start_iter = int(st["iteration"]) + 1
+        args.init_points = int(st["init_points"])
+        print(f"[resume] iteration {start_iter}/{args.iterations}, "
+              f"{model.points.shape[0]:,} points, init_points={args.init_points:,}")
+    elif getattr(args, "resume", False):
+        print("[resume] no train_state.pt found; starting from scratch")
 
     viewer = None
     viewer_lock = nullcontext()
@@ -171,13 +231,17 @@ def train(args):
                   f"quantiles={tuple(args.distortion_quantiles)} "
                   f"scene_diag={distortion_scale:.3f}")
 
-        with tqdm.trange(args.iterations, desc="Training") as train:
+        with tqdm.trange(start_iter, args.iterations, desc="Training") as train:
             for i in train:
                 if viewer is not None:
                     viewer.step(i)
                     viewer.wait_if_paused()
 
-                if i and i in args.downsample_iterations:
+                # `share_handler` implies every `downsample` entry is equal, so this reload would
+                # re-decode the dataset at the resolution it already holds -- no effect, but it
+                # briefly holds the old and new copies at once, which is exactly the memory spike
+                # the sharing above exists to avoid. Skip it.
+                if i and i in args.downsample_iterations and not share_handler:
                     downsample_idx = args.downsample_iterations.index(i)
                     downsample = args.downsample[downsample_idx]
                     train_data_handler.reload(train_split, downsample=downsample)
@@ -489,9 +553,16 @@ def train(args):
                         "lr/texel_height_lr", model.texel_height_scheduler(i), i
                     )
 
-                if i % 1000 == 999 and not args.dry_run:
+                if i % getattr(args, "ckpt_every", 1000) == getattr(args, "ckpt_every", 1000) - 1                         and not args.dry_run:
                     model.save_pt(f"{out_dir}/model.pt")
                     model.save_pc(f"{out_dir}/points.ply")
+                    # Written AFTER model.pt and swapped in atomically: a wall-clock kill between
+                    # the two must never leave a train_state.pt newer than the geometry it indexes.
+                    tmp = f"{out_dir}/train_state.pt.tmp"
+                    torch.save({"iteration": i,
+                                "optimizer": model.optimizer.state_dict(),
+                                "init_points": int(args.init_points)}, tmp)
+                    os.replace(tmp, f"{out_dir}/train_state.pt")
 
                 torch.cuda.nvtx.range_push("Resampling")
 
@@ -548,8 +619,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "-c", "--config", is_config_file=True, help="Path to config file"
     )
+    # Checkpoint-resume. Ibex denies explicit partition selection and routes on TIME LIMIT:
+    # <=4h lands in `gpu4`, which holds by far the most free GPUs, while >4h is confined to the
+    # saturated `gpu`/`gpu24`. Without resume a 17h scene cannot use `gpu4` at all; with it, the
+    # scene becomes a chain of short jobs that backfill.
+    parser.add_argument("--resume", action="store_true",
+                        help="continue from <out_dir>/train_state.pt if present")
+    # BOTH spellings, deliberately. train.py dumps every resolved arg into output/<exp>/config.yaml,
+    # and configargparse serialises this one by its dest -- `ckpt_every: 1000`. Feeding that file
+    # back with -c (which is exactly what --resume does) then emits `--ckpt_every=1000`, which an
+    # underscore-less option rejects: the run dies at parse time before a single iteration. Every
+    # resumed run on 995 hit this. Accepting the underscore form makes the config round-trip.
+    parser.add_argument("--ckpt-every", "--ckpt_every", type=int, default=1000,
+                        help="iterations between resumable checkpoints")
 
     # Parse arguments
     args = parser.parse_args()
 
-    train(get_params(args))
+    _p = get_params(args)
+    _p.resume = args.resume
+    _p.ckpt_every = args.ckpt_every
+    train(_p)

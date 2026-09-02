@@ -167,6 +167,14 @@ class Params:
     use_metric3d: bool = False
     is_pinhole: bool = False
     eval: bool = False
+    # Cap on the training image width, applied in memory after decoding, mirroring INRIA 3DGS's
+    # `--resolution -1` behaviour (it downscales anything wider than 1600 by `orig_w / 1600`).
+    # Needed to reproduce a published 3DGS baseline's resolution exactly: ScanNet++ DSLR frames
+    # are 1752 px wide, so those runs actually trained at 1600x1066, not the 1752x1168 that the
+    # released `cameras.json` reports -- that file is written from the pre-resize camera info.
+    # PSNR is resolution-dependent, so matching this is required for the numbers to be comparable.
+    # None (default) leaves the image at its stored resolution.
+    max_image_width: int = None
 
     # Model parameters
     init_type: str

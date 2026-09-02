@@ -29,9 +29,20 @@ def _segment_exclusive_cumsum(values: torch.Tensor, group_ids: torch.Tensor, gro
     every i, given `values`/`group_ids` already sorted so each group is
     contiguous. `group_start_idx[g]` is the index of group g's first element.
     """
-    global_cumsum = torch.cumsum(values, dim=0)
-    base = global_cumsum[group_start_idx] - values[group_start_idx]
-    return global_cumsum - values - base[group_ids]
+    # FLOAT64 IS REQUIRED, not a precaution. `values` here are log(1-alpha), all negative, and the
+    # GLOBAL cumsum over one view's ~9.4M intersections reaches magnitude ~7e6. Recovering a local
+    # value of order 0.5 by subtracting two such numbers is catastrophic cancellation: in float32
+    # the ULP at 7e6 is ~0.5, so the returned log-transmittance carried a MEDIAN error of 9.1e-02
+    # and a max of 9.8e-01 -- i.e. transmittance wrong by up to e^0.98 ~ 2.7x.
+    #
+    # The symptom was that per-pixel weights summed to more than 1, which alpha compositing makes
+    # impossible (sum_i alpha_i T_i = 1 - T_final <= 1). Measured on the shipped garden operator:
+    # 2,635,067 of 6.5M rows summed above 1, max 2.1092. Reproduced synthetically at 74,644 rows
+    # and max 1.9199 in float32, versus ZERO rows and max 1.0000 in float64.
+    work = values.double()
+    global_cumsum = torch.cumsum(work, dim=0)
+    base = global_cumsum[group_start_idx] - work[group_start_idx]
+    return (global_cumsum - work - base[group_ids]).to(values.dtype)
 
 
 @torch.no_grad()

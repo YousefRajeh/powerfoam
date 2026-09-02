@@ -766,7 +766,14 @@ class PowerfoamScene(nn.Module):
             valid_indices = torch.nonzero(contrib_mask, as_tuple=False)[:, 0]
 
             num_samples = target_num_points - valid_indices.shape[0]
-            if num_samples == 0:
+            # `<= 0`, not `== 0`. A negative count means more points survived the contribution test
+            # than this iteration's growth target allows, and torch.multinomial rejects it outright
+            # ("cannot sample n_sample <= 0 samples"), killing the run. It cannot arise in a clean
+            # run -- the target only grows -- but it does on RESUME from an interrupted checkpoint,
+            # where model.pt is a few hundred iterations ahead of the recorded iteration (the two are
+            # separate writes) and the geometry therefore leads the schedule. Skipping the resample
+            # lets the target catch up within a few densification rounds.
+            if num_samples <= 0:
                 return num_samples
 
             point_error_q = torch.quantile(self.point_error_ema, 0.99, dim=0)

@@ -1,0 +1,55 @@
+alpha_format_on_disk: straight
+bkgd_color: [0.0, 0.0, 0.0]
+constant_radii: false
+contribution_weight: 0.1
+data_path: D:\Downloads\spp_data_1600
+dataset: colmap
+densify_from: 1000
+densify_until: 24000
+density_activation: softplus
+density_lr_final: 1.0
+density_lr_init: 1.0
+density_warmup_steps: 1000
+disable_coop_adj_load: false
+disable_coop_prim_load: false
+distortion_channel: both
+distortion_min_alpha: 0.5
+distortion_mode: iqr
+distortion_num_quantiles: 16
+distortion_quantiles: [0.1, 0.9]
+distortion_weight: 0.0
+downsample: [1, 1]
+downsample_iterations: [0, 500]
+dry_run: false
+eval: false
+experiment_name: spp_pf_matched_27dd4da69e
+final_points: 1022151
+freeze_points: false
+init_points: 41349
+init_type: sfm
+interpenetration_weight: 0.0001
+is_pinhole: true
+iterations: 30000
+max_image_width: 1600
+normal_supervision: false
+normal_weight: 0.1
+num_texel_sites: 8
+points_lr_final: 5.0e-05
+points_lr_init: 0.001
+quaternions_lr_final: 0.01
+quaternions_lr_init: 0.1
+radii_lr_final: 5.0e-06
+radii_lr_init: 5.0e-05
+render_objective: volume
+scene: 27dd4da69e
+sv_dof: 8
+texel_height_lr_final: 0.0005
+texel_height_lr_init: 0.005
+texel_sites_lr_final: 0.001
+texel_sites_lr_init: 0.01
+texel_sv_axis_lr_final: 0.005
+texel_sv_axis_lr_init: 0.05
+texel_sv_rgb_lr_final: 0.0005
+texel_sv_rgb_lr_init: 0.005
+use_metric3d: false
+viewer: false

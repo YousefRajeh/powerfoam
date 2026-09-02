@@ -187,6 +187,12 @@ class TorchCamera:
     height: int
     ray_maps: torch.Tensor = None
     fov_cos_cutoff: float = None
+    # Lazy alternative to a materialised `ray_maps`, for datasets with many views.
+    # `cam_ray_dirs` is the (H*W, 3) camera-space ray direction grid, which depends only on the
+    # intrinsics and is therefore SHARED (same tensor object) by every camera in a dataset;
+    # `c2w_rot` is this view's 3x3 rotation. See `_build_ray_maps_from_basis`.
+    cam_ray_dirs: torch.Tensor = None
+    c2w_rot: torch.Tensor = None
 
     def to_warp(self):
         warp_cam = WarpCamera()
@@ -196,6 +202,8 @@ class TorchCamera:
         warp_cam.width = self.width
         warp_cam.height = self.height
         ray_maps = self.ray_maps
+        if ray_maps is None and self.cam_ray_dirs is not None:
+            ray_maps = self._build_ray_maps_from_basis()
         if ray_maps is None:
             ray_maps = self._build_pinhole_ray_maps()
         warp_cam.ray_maps = wp.from_torch(ray_maps, dtype=wp.float32)
@@ -203,6 +211,29 @@ class TorchCamera:
             self.fov_cos_cutoff if self.fov_cos_cutoff is not None else 0.0
         )
         return warp_cam
+
+    def _build_ray_maps_from_basis(self):
+        """Reconstruct this view's world-space ray map from the shared camera-space basis.
+
+        Arithmetic identical to what the COLMAP/ScanNet++ loaders used to precompute per image;
+        it is done here on demand so the (H, W, 6) map never has to be stored for every view.
+        That storage was the binding memory constraint on large scenes: at 733 views it is twice
+        the size of the RGB set, and it was PINNED, so the kernel could neither swap nor reclaim
+        it -- a ScanNet++ run stalled at a flat 41.9 GB against a 50 GB cgroup, making no
+        progress, rather than failing outright. Keeping only the shared basis makes this term
+        O(H*W) instead of O(views * H * W).
+
+        NOTE the directions come from the shared grid (built from pycolmap's exact intrinsics,
+        including a principal point that is not the image centre), NOT from
+        `_build_pinhole_ray_maps`, which derives them from the right/up basis and assumes a
+        centred principal point. The two agree only when cx, cy == W/2, H/2.
+        """
+        dirs = self.cam_ray_dirs
+        rot = self.c2w_rot.to(dirs.device)
+        world_dirs = torch.einsum("ij,kj->ik", dirs, rot)
+        origins = self.eye.to(dirs.device)[None, :].expand(world_dirs.shape[0], 3)
+        ray_maps = torch.cat([origins, world_dirs], dim=-1)
+        return ray_maps.reshape(self.height, self.width, 6).contiguous()
 
     def _build_pinhole_ray_maps(self):
         i = torch.arange(self.height, dtype=self.eye.dtype, device=self.eye.device)
@@ -235,6 +266,12 @@ class TorchCamera:
             height=self.height,
             ray_maps=self.ray_maps.to(dev) if self.ray_maps is not None else None,
             fov_cos_cutoff=self.fov_cos_cutoff,
+            # `.to(dev)` on an already-resident tensor is a no-op returning the SAME object, so
+            # the basis stays shared across views rather than being copied once per camera.
+            cam_ray_dirs=(
+                self.cam_ray_dirs.to(dev) if self.cam_ray_dirs is not None else None
+            ),
+            c2w_rot=self.c2w_rot.to(dev) if self.c2w_rot is not None else None,
         )
 
     def get_ray_dir(self, i, j):

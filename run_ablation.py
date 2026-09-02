@@ -35,6 +35,7 @@ sys.path.insert(0, r"D:\Downloads\powerfoam")
 import ablation_db as DB
 from ablation_adjacency import build_for, load_cech_powerfoam
 from ablation_surface import GTSurfaceIndex, semantic_surface_metrics
+from ablation_opacity import DEFAULT_THRESHOLD, mask_low_opacity, primitive_alpha
 from ablation_assign import RECONS, compute_assignment, load_primitives
 from determinism import enable_determinism
 from diagnose_scannet_miou import spherical_kmeans
@@ -46,6 +47,13 @@ from run_cluster_classify_eval import (SCENES, euclidean_kmeans, pool_classify_b
                                        two_level_position_aware)
 
 CLASS_SETS = ["opengaussian19", "opengaussian15", "opengaussian10"]
+# None = score every GT point; 0.1 = OpenGaussian/NormLift, which DELETE points whose
+# primitive is below that opacity. Both are always run: the masked number is the one
+# comparable to published baselines, the unmasked one is the honest representation
+# comparison, and they differ by +1.08 (pf_nonfroz) to +11.09 (rf_unfroz) mIoU.
+MASKS = [None, DEFAULT_THRESHOLD]
+# OpenGaussian/LUDVIG zero any cluster with fewer than 2 members (eval_scannet.py:139).
+MIN_LEAF_SUPPORT = 2
 COMPLEXES = ["delaunay", "alpha", "cech"]
 SOLVERS = ["geometric_median", "weighted", "ridge", "inverse_variance"]
 # `weighted` is the solver splat-distiller uses for Gaussians; including it for the
@@ -72,6 +80,8 @@ FEATURE_PATHS = {
     "rf_unfroz":  "artifacts/scannet/{scene}/solved_{solver}_rf_unfroz_ogl3.pt",
     "gs_froz":    "artifacts/scannet/{scene}/solved_{solver}_gs_froz_ogl3.pt",
     "gs_unfroz":  "artifacts/scannet/{scene}/solved_{solver}_gs_unfroz_ogl3.pt",
+    "rf20k_froz":   "artifacts/scannet/{scene}/solved_{solver}_rf20k_froz_ogl3.pt",
+    "rf20k_unfroz": "artifacts/scannet/{scene}/solved_{solver}_rf20k_unfroz_ogl3.pt",
 }
 
 
@@ -261,6 +271,9 @@ def run_scene(con, run_id, scene, recons, log):
         log(f"  {recon}: kind={prim['kind']} N={n_prim:,}")
 
         assigned, method = get_assignment(con, scene, recon, gt_points, log)
+        alpha = primitive_alpha(recon, scene)
+        if alpha is None:
+            log(f"    [no alpha] {recon}: opacity-masked rows will be skipped")
 
         for cx in COMPLEXES:
             if cx == "cech" and not recon.startswith("pf_"):
@@ -319,19 +332,38 @@ def run_scene(con, run_id, scene, recons, log):
 
             for gname, labels, nlab, cx in groupings_for(unit, positions, adj_for_grow, log):
                 for cs in CLASS_SETS:
-                    if DB.have_result(con, scene, recon, FEATURE_TAG, solver, gname, cs):
+                  for mask in MASKS:
+                    if mask is not None and alpha is None:
+                        continue
+                    if DB.have_result(con, scene, recon, FEATURE_TAG, solver, gname, cs, mask):
                         continue
                     t0 = time.time()
                     kept = [(name_to_id[n], n) for n in OPENGAUSSIAN_CLASS_SETS[cs]
                             if name_to_id[n] in present_ids]
                     tids = [i for i, _ in kept]
                     tnames = [n for _, n in kept]
-                    gt_t = torch.from_numpy(remap_gt_labels(raw_labels, tids)).long()
+                    gt_np = remap_gt_labels(raw_labels, tids)
+                    kept_frac = 1.0
+                    if mask is not None:
+                        gt_np, _n_masked, kept_frac = mask_low_opacity(gt_np, assigned, alpha, mask)
+                    gt_t = torch.from_numpy(gt_np).long()
                     text = embed_class_names(tnames, "cuda")
                     # A grouping may decline to cluster a primitive (label -1). Pool over the
                     # clustered ones only, and mark the rest unclassified so they reach the
                     # metric as "no prediction" rather than being folded into some cluster.
+                    # OpenGaussian zeroes the language feature of any leaf occupied by fewer
+                    # than MIN_LEAF_SUPPORT primitives (`eval_scannet.py:139`,
+                    # `leaf_lang_feat[leaf_occu_count < 2] *= 0.0`), and LUDVIG inherits their
+                    # eval verbatim. It is a minimum-support rule on the CLUSTER, not the
+                    # primitive: a singleton leaf's pooled feature is one observation with no
+                    # agreement behind it. We had no equivalent, and it matters most for the
+                    # grow arms, which produce thousands of tiny regions.
                     in_cluster = (labels >= 0)
+                    if MIN_LEAF_SUPPORT > 1:
+                        counts = torch.bincount(labels[in_cluster], minlength=nlab)
+                        weak = counts < MIN_LEAF_SUPPORT
+                        if bool(weak.any()):
+                            in_cluster = in_cluster & ~weak[labels.clamp_min(0)]
                     cls_v = np.full(len(vidx), -1, dtype=np.int64)
                     if bool(in_cluster.any()):
                         sub = pool_classify_broadcast(labels[in_cluster], unit[in_cluster],
@@ -362,13 +394,16 @@ def run_scene(con, run_id, scene, recons, log):
                     ious, miou, acc, macc = calculate_metrics(
                         gt_t, torch.from_numpy(pred).long(), len(tnames) + 1)
                     per_class = {tnames[c - 1]: float(ious[c]) for c in range(1, len(tnames) + 1)}
-                    if cs not in surf_index:
-                        surf_index[cs] = GTSurfaceIndex(gt_pts64, gt_t.numpy(), len(tnames) + 1)
-                    surf = semantic_surface_metrics(surf_index[cs], pred)
+                    skey = (cs, mask)
+                    if skey not in surf_index:
+                        surf_index[skey] = GTSurfaceIndex(gt_pts64, gt_t.numpy(), len(tnames) + 1)
+                    surf = semantic_surface_metrics(surf_index[skey], pred)
                     DB.put_result(con, run_id, scene, recon, FEATURE_TAG, solver, gname, cx,
                                   cs, len(tnames), miou, macc, acc, per_class,
-                                  time.time() - t0, surface=surf)
-                    log(f"    {recon}/{solver}/{gname}/{cs}: mIoU={miou*100:.2f} "
+                                  time.time() - t0, surface=surf,
+                                  mask_opacity=mask, kept_fraction=kept_frac)
+                    mtag = "raw " if mask is None else f"m{mask:g}"
+                    log(f"    {recon}/{solver}/{gname}/{cs}[{mtag}]: mIoU={miou*100:.2f} "
                         f"mAcc={macc*100:.2f} scd={surf.get('scd', float('nan'))*100:.2f}cm "
                         f"bF1={surf.get('boundary_f1', float('nan')):.3f} "
                         f"missed={surf.get('n_missed', 0)}")

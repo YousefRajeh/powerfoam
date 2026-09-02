@@ -100,6 +100,13 @@ def two_level_position_aware(positions, unit_feats, seed=0, leaf_init="randperm"
     return leaf_global
 
 
+# OpenGaussian zeroes any leaf occupied by fewer than 2 primitives (`eval_scannet.py:139`,
+# `leaf_lang_feat[leaf_occu_count < 2] *= 0.0`); LUDVIG inherits their eval verbatim. It is a
+# minimum-support rule on the CLUSTER: a singleton leaf's pooled feature is a single
+# observation with no agreement behind it. Set MIN_LEAF_SUPPORT=1 to disable.
+MIN_LEAF_SUPPORT = int(os.environ.get("MIN_LEAF_SUPPORT", "1"))
+
+
 def pool_classify_broadcast(labels, unit_feats, num_labels, text_feats, weights=None):
     """weights: optional (N,) per-primitive pooling weight (e.g. #GT points owned) --
     aligns the pooled mean with what the point-level metric actually reads."""
@@ -110,7 +117,10 @@ def pool_classify_broadcast(labels, unit_feats, num_labels, text_feats, weights=
     pooled = pooled / norms.clamp_min(1e-8)
     cls = torch.full((num_labels,), -1, dtype=torch.long, device=unit_feats.device)
     cls[nonempty] = classify_primitives(pooled[nonempty], text_feats)
-    return cls[labels]  # per-primitive class, -1 impossible (every primitive's own leaf is nonempty)
+    if MIN_LEAF_SUPPORT > 1:
+        counts = torch.bincount(labels, minlength=num_labels)
+        cls[counts < MIN_LEAF_SUPPORT] = -1      # under-supported leaf -> no prediction
+    return cls[labels]
 
 
 def main():

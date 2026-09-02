@@ -48,6 +48,13 @@ class DataHandler:
                 downsample=downsample,
                 alpha_format_on_disk=self.args.alpha_format_on_disk,
                 use_metric3d=self.args.use_metric3d,
+                # Only forwarded when actually set, so the loaders that do not implement it
+                # (blender, replica) keep their existing signatures.
+                **(
+                    {"max_image_width": self.args.max_image_width}
+                    if getattr(self.args, "max_image_width", None)
+                    else {}
+                ),
             )
         else:
             split_dataset = dataset(

@@ -1,0 +1,31 @@
+Warp 1.10.0 initialized:
+   CUDA Toolkit 12.8, Driver 12.0
+   Devices:
+     "cpu"      : "Intel64 Family 6 Model 85 Stepping 7, GenuineIntel"
+     "cuda:0"   : "NVIDIA RTX 6000 Ada Generation" (48 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     \\?\C:\Users\rajehyl\AppData\Local\NVIDIA\warp\Cache\1.10.0
+Module powerfoam.bvh 73d7751 load on device 'cuda:0' took 1.54 ms  (cached)
+[accumulate_feature_stats_sam] scene=scene0590_00 views=135 num_primitives=668871 batch_size=1
+Module powerfoam.rasterize b946f8f load on device 'cuda:0' took 2.46 ms  (cached)
+Module powerfoam.rasterize dd1851d load on device 'cuda:0' took 2.51 ms  (cached)
+[accumulate_feature_stats] view 30: dropped 2 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 31: dropped 2 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 32: dropped 5 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 33: dropped 63 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 35: dropped 242 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 36: dropped 1 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 44: dropped 124 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 46: dropped 8 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 47: dropped 109 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 64: dropped 3 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 92: dropped 6 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 93: dropped 26 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 94: dropped 50 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 95: dropped 46 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 120: dropped 6 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] view 121: dropped 12 hits beyond max_hits_per_pixel=64
+[accumulate_feature_stats] total dropped hits across all views: 705
+[accumulate_feature_stats] folded in 135 views, valid_fraction=0.8661
+[accumulate_feature_stats_sam] TIMING batch_size=1 num_views=135 elapsed_sec=134.543 sec_per_view=0.9966
+[accumulate_feature_stats_sam] wrote artifacts/scannet/scene0590_00/stats_cos_nonfrozen_ogl3.pt

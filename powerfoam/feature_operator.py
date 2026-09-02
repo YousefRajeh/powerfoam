@@ -231,6 +231,52 @@ def accumulate_feature_stats_for_views(
             out_val = hard.reshape(-1)
         elif weight_transform == "sq":
             out_val = out_val * out_val
+        elif weight_transform in ("cos", "cos2"):
+            # FORESHORTENING CORRECTION, dipole-native.
+            #
+            # A_rj = alpha*T with alpha = 1 - exp(-sigma*dt), and dt is the length the ray
+            # cuts through the cell's OCCUPIED region (the kernel clips it at the displaced
+            # dipole surface). For a locally planar surface a ray at angle theta to the
+            # dipole normal traverses ~t/cos(theta), so ALPHA IS INFLATED BY 1/cos AT GRAZING
+            # INCIDENCE. The lifting therefore gives the MOST weight to the views that sample
+            # the surface WORST: a grazing view has the fewest pixels per unit surface area,
+            # the most mixing with neighbouring surfaces, and the least reliable SAM mask
+            # boundary. Multiplying by cos undoes the path-length inflation and makes the
+            # weight proportional to PROJECTED AREA -- a view-independent measure of the
+            # cell's intrinsic opacity, which is what a feature ought to be averaged over.
+            #   'cos'  -- cancel the 1/cos inflation exactly (the principled choice)
+            #   'cos2' -- additionally down-weight grazing views (a Lambertian-style prior;
+            #             strictly an extra assumption, so it is a separate arm)
+            # Only PowerFoam can do this: it needs a per-primitive surface NORMAL, which a
+            # Gaussian does not have.
+            #
+            # PRIOR, recorded before running: weight-reshaping in this project has a poor
+            # track record -- reliability weighting was null (inert under the narrow CLIP
+            # cone), 'tau' was null, 'sq' was -1.21 and 'top1' -3.31. The difference here is
+            # that this corrects a KNOWN GEOMETRIC BIAS rather than sharpening a
+            # distribution, and it is a soft multiplicative factor in [0,1], so the softness
+            # law does not obviously condemn it.
+            # .detach() is load-bearing: quaternions is an nn.Parameter, so get_normals()
+            # builds an autograd graph. Without this the graph is retained for EVERY view
+            # (the weights feed the stats accumulation), which OOM'd at 45 GiB over 54 views.
+            with torch.no_grad():
+                n_world = model.get_normals().detach()                       # (P,3)
+            cdev = camera.right.device            # camera basis may live on CPU
+            pix = torch.arange(num_pixels, device=cdev)
+            d_ray = camera.get_ray_dir((pix // W).float(), (pix % W).float()).to(device)
+            d_ray = d_ray / d_ray.norm(dim=-1, keepdim=True)                 # (num_pixels,3)
+            cols = out_col.reshape(num_pixels, max_hits_per_pixel).long()
+            cols = cols.clamp(0, n_world.shape[0] - 1)   # unused slots hold garbage indices
+            vmat = out_val.reshape(num_pixels, max_hits_per_pixel)
+            # chunked: n_world[cols] alone is (num_pixels, 64, 3) ~= 1 GiB per view
+            PCH = max(1, int(2e7 // max(max_hits_per_pixel, 1)))
+            for b in range(0, num_pixels, PCH):
+                sl = slice(b, min(b + PCH, num_pixels))
+                cw = (n_world[cols[sl]] * d_ray[sl][:, None, :]).sum(-1).abs().clamp(1e-3, 1.0)
+                if weight_transform == "cos2":
+                    cw = cw * cw
+                vmat[sl] *= cw
+            out_val = vmat.reshape(-1)
         elif weight_transform == "tau":
             # 'tau' -- weight by OPTICAL DEPTH instead of alpha.
             #

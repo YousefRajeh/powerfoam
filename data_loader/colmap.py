@@ -30,8 +30,31 @@ def get_cam_raymaps(camera):
 
 
 class COLMAPDataset:
-    def __init__(self, datadir, split, downsample, alpha_format_on_disk, use_metric3d):
+    def _maybe_resize(self, im):
+        """Downscale to `max_image_width`, reproducing INRIA 3DGS's `--resolution -1` rule.
+
+        Theirs is: `global_down = orig_w / 1600` when `orig_w > 1600` (else 1), then
+        `resize((int(orig_w / global_down), int(orig_h / global_down)))` with PIL's default
+        resampling. Reproduced exactly, including the truncation, so a run can be compared
+        against a published 3DGS baseline at the resolution that baseline actually trained at.
+        Images at or below the cap are returned untouched.
+        """
+        if not self.max_image_width or im.width <= self.max_image_width:
+            return im
+        scale = im.width / self.max_image_width
+        return im.resize((int(im.width / scale), int(im.height / scale)))
+
+    def __init__(
+        self,
+        datadir,
+        split,
+        downsample,
+        alpha_format_on_disk,
+        use_metric3d,
+        max_image_width=None,
+    ):
         assert downsample in [1, 2, 4, 8]
+        self.max_image_width = max_image_width
 
         self.root_dir = datadir
         self.colmap_dir = os.path.join(datadir, "sparse/0/")
@@ -78,14 +101,18 @@ class COLMAPDataset:
         names = list(str(name) for name in names)
 
         im = Image.open(os.path.join(images_dir, names[0]))
-        self.img_wh = im.size
+        self.img_wh = self._maybe_resize(im).size
         im.close()
 
         self.camera = list(self.reconstruction.cameras.values())[0]
         self.camera.rescale(self.img_wh[0], self.img_wh[1])
 
         cam_space_right, cam_space_up = image_plane_basis(self.camera)
-        cam_ray_dirs = get_cam_raymaps(self.camera)
+        # Depends only on the intrinsics, so it is built once and SHARED by every camera below
+        # rather than being expanded into a per-view world-space map. See the note in the camera
+        # construction loop.
+        cam_ray_dirs = get_cam_raymaps(self.camera).pin_memory()
+        self.cam_ray_dirs = cam_ray_dirs
 
         self.images = []
         for name in names:
@@ -102,9 +129,17 @@ class COLMAPDataset:
 
         self.poses = []
         self.all_cameras = []
-        self.all_rgbs = []
-        self.all_alphas = []
-        for image in tqdm(self.images):
+        # Preallocated PINNED, and filled in place below, instead of appending to a list and then
+        # doing `torch.stack(...).pin_memory()`. That sequence holds three copies of the whole
+        # image set at once (the list, the stacked tensor, and the pinned tensor), so peak host
+        # memory was ~3x the steady-state cost -- the difference between fitting and being
+        # OOM-killed on the 733-view scene at full resolution. `DataHandler` calls `.pin_memory()`
+        # on these again, which is a no-op returning self for already-pinned tensors.
+        n_views = len(self.images)
+        W_img, H_img = self.img_wh
+        self.all_rgbs = torch.empty((n_views, H_img, W_img, 3), dtype=torch.float32).pin_memory()
+        self.all_alphas = torch.empty((n_views, H_img, W_img), dtype=torch.float32).pin_memory()
+        for view_idx, image in enumerate(tqdm(self.images)):
             c2w = torch.tensor(
                 image.cam_from_world().inverse().matrix(), dtype=torch.float32
             )
@@ -112,15 +147,17 @@ class COLMAPDataset:
             world_right = torch.einsum("j,kj->k", cam_space_right, c2w[:, :3])
             world_up = torch.einsum("j,kj->k", cam_space_up, c2w[:, :3])
 
-            world_ray_dirs = torch.einsum(
-                "ij,kj->ik",
-                cam_ray_dirs,
-                c2w[:, :3],
-            )
-            world_ray_origins = c2w[:3, 3] + torch.zeros_like(cam_ray_dirs)
-            world_rays = torch.cat([world_ray_origins, world_ray_dirs], dim=-1)
-            world_rays = world_rays.reshape(self.img_wh[1], self.img_wh[0], 6)
-
+            # The world-space (H, W, 6) ray map is NOT materialised here. It used to be, and
+            # pinned, which made host memory the binding constraint on large scenes: the map is
+            # 6 floats per pixel, i.e. twice the RGB image, and pinned pages cannot be swapped or
+            # reclaimed. A 733-view ScanNet++ scene stalled at a flat 41.9 GB against a 50 GB
+            # cgroup -- alive but making no progress, thrashing in reclaim -- and at full
+            # resolution the same scene was OOM-killed outright, which ends the SLURM job and
+            # returns the node.
+            #
+            # `TorchCamera` rebuilds the map on demand from `cam_ray_dirs` (shared) and this
+            # view's rotation, with arithmetic identical to what was here before, so nothing about
+            # the geometry changes. Storage for this term drops from O(views * H * W) to O(H * W).
             self.all_cameras.append(
                 TorchCamera(
                     eye=c2w[:3, 3].pin_memory(),
@@ -128,30 +165,35 @@ class COLMAPDataset:
                     up=world_up.pin_memory(),
                     width=self.img_wh[0],
                     height=self.img_wh[1],
-                    ray_maps=world_rays.pin_memory(),
+                    cam_ray_dirs=cam_ray_dirs,
+                    c2w_rot=c2w[:, :3].contiguous().pin_memory(),
                 )
             )
 
-            im = Image.open(os.path.join(images_dir, image.name))
-            rgba = np.array(im.convert("RGBA"), dtype=np.float32) / 255.0
+            im = self._maybe_resize(Image.open(os.path.join(images_dir, image.name)))
+            # Decoded as uint8 and widened straight into the preallocated destination, rather than
+            # building `np.array(..., dtype=np.float32) / 255.0` first. That produced two
+            # full-resolution float32 RGBA temporaries per image (~33 MB each at 1752x1168), and
+            # the resulting allocator churn -- not the retained data -- was what pushed host memory
+            # to the cgroup limit: RSS climbed ~63 MB per image loaded while the retained buffers
+            # accounted for only 24 GB. Staying in uint8 until the copy makes the transient 8 MB.
+            # `Tensor.copy_` casts uint8 -> float32 during the copy, so no wide temporary exists.
+            rgba_u8 = torch.from_numpy(np.asarray(im.convert("RGBA"), dtype=np.uint8))
+            dst_rgb, dst_a = self.all_rgbs[view_idx], self.all_alphas[view_idx]
             if self.alpha_format_on_disk == "premultiplied":
-                alphas = torch.tensor(rgba[..., 3], dtype=torch.float32)
-                rgbs = torch.tensor(rgba[..., :3], dtype=torch.float32)
+                dst_a.copy_(rgba_u8[..., 3]).div_(255.0)
+                dst_rgb.copy_(rgba_u8[..., :3]).div_(255.0)
             elif self.alpha_format_on_disk == "straight":
-                alphas = torch.tensor(rgba[..., 3], dtype=torch.float32)
-                rgbs = torch.tensor(rgba[..., :3] * rgba[..., 3:4], dtype=torch.float32)
+                dst_a.copy_(rgba_u8[..., 3]).div_(255.0)
+                dst_rgb.copy_(rgba_u8[..., :3]).div_(255.0).mul_(dst_a.unsqueeze(-1))
             else:
                 raise ValueError(
                     f"Unsupported alpha format on disk: {self.alpha_format_on_disk}"
                 )
             im.close()
-
-            self.all_rgbs.append(rgbs)
-            self.all_alphas.append(alphas)
+            del rgba_u8, dst_rgb, dst_a
 
         self.poses = torch.stack(self.poses)
-        self.all_rgbs = torch.stack(self.all_rgbs)
-        self.all_alphas = torch.stack(self.all_alphas)
 
         self.points3D = []
         self.points3D_color = []

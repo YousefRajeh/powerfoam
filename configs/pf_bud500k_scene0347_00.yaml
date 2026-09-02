@@ -1,0 +1,55 @@
+# Normal (non-frozen) training on the same ScanNet scenes as scannet_frozen.yaml -- same
+# starting point cloud (init_points overridden per-scene to match its exact SfM count, same as
+# the frozen config), but with real densify/prune enabled, growing to a modest 3x budget by
+# default (final_points overridden per-scene = 3 * init_points via CLI, no external reference
+# for "correct" ScanNet indoor-room point budget exists, so this is a documented, adjustable
+# choice, not a calibrated one). The ONLY intended difference from scannet_frozen.yaml is
+# densify_from/until -- everything else should match so the frozen-vs-not comparison isolates
+# that one variable.
+
+# Experiment parameters
+iterations: 30_000
+densify_from: 1_000
+densify_until: 24_000
+normal_weight: 0.1
+contribution_weight: 0.1
+interpenetration_weight: 1e-4
+
+# Dataset parameters
+dataset: "colmap"
+data_path: "data/scannet"
+scene: "scene0347_00_colmap"
+alpha_format_on_disk: "straight"
+downsample: [1, 1]
+downsample_iterations: [0, 500]
+is_pinhole: true
+eval: false
+
+# Model parameters
+init_type: "sfm"
+init_points: 67984
+final_points: 500000
+bkgd_color: [0.0, 0.0, 0.0]
+render_objective: "volume"
+sv_dof: 8
+num_texel_sites: 8
+
+# Optimization parameters
+points_lr_init: 1e-3
+points_lr_final: 5e-5
+density_lr_init: 1e0
+density_lr_final: 1e0
+radii_lr_init: 5e-5
+radii_lr_final: 5e-6
+quaternions_lr_init: 1e-1
+quaternions_lr_final: 1e-2
+texel_sites_lr_init: 1e-2
+texel_sites_lr_final: 1e-3
+texel_sv_axis_lr_init: 5e-2
+texel_sv_axis_lr_final: 5e-3
+texel_sv_rgb_lr_init: 5e-3
+texel_sv_rgb_lr_final: 5e-4
+texel_height_lr_init: 5e-3
+texel_height_lr_final: 5e-4
+
+experiment_name: "pf_bud500k_scene0347_00"

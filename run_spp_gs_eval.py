@@ -1,0 +1,219 @@
+"""ScanNet++ evaluation for the Gaussian arm (refbench 3DGS), same protocol as the other two.
+
+THREE THINGS ARE GAUSSIAN-SPECIFIC, and each is forced by the representation:
+
+  * ASSIGNMENT is MAHALANOBIS, per Dr.Splat (arXiv 2502.16652): d = (p-mu)^T Sigma^-1 (p-mu).
+    Gaussians overlap and have unbounded support, so "which primitive owns this point" is genuinely
+    ill-posed and nearest-CENTRE would unfairly handicap the baseline. Foam does not need this --
+    its cells are a disjoint partition -- which is exactly why the two arms use different queries
+    and the same downstream scorer. Evaluated over the k Euclidean-nearest candidates, which is the
+    standard practical form (an exact global Mahalanobis search is quadratic and unnecessary: a
+    Gaussian whose centre is far in Euclidean terms cannot win on Mahalanobis unless it is enormous,
+    and `k` is set well above Dr.Splat's own top-k).
+  * CENTRES come from the ply's `means`.
+  * There is NO native adjacency, so the graph is Euclidean KNN (K=30) -- NormLift's own choice, and
+    measured on ScanNet to differ from the exact dual by <=0.15 mIoU.
+"""
+import json
+import os
+import sqlite3
+import sys
+import time
+
+sys.path.insert(0, r"D:\Downloads\feature-foam-lifting\src")
+sys.path.insert(0, r"D:\Downloads\powerfoam")
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from plyfile import PlyData
+from scipy.spatial import cKDTree
+
+from evaluate_point_cloud_miou import embed_class_names, remap_gt_labels
+from run_simplex_diffusion_eval import csr_to_edges, diffuse
+from run_derived_stack_eval import rank_encode
+from run_normlift_refine_eval import mode_vote_refine
+from eval_semantic_surface import semantic_surface_metrics
+from normlift_replication import knn_csr_safe
+from run_overnight import SPP, DB, LAM, CSLS_K, RANK_S, ALPHA, ITERS, log, csls, score_pred
+from run_spp_eval import benchmark_map, load_gt, coverage_filter
+
+ART = "artifacts/scannetpp_gs"
+GS = r"D:\Downloads\refbench_3dgs_12scenes\output"
+
+
+def load_gaussians(scene):
+    p = os.path.join(GS, f"refbench-{scene}", "point_cloud", "iteration_30000",
+                     "scene_point_cloud.ply")
+    v = PlyData.read(p)["vertex"]
+    means = np.stack([np.asarray(v[k]) for k in ("x", "y", "z")], 1).astype(np.float64)
+    scales = np.exp(np.stack([np.asarray(v[f"scale_{i}"]) for i in range(3)], 1)).astype(np.float64)
+    quats = np.stack([np.asarray(v[f"rot_{i}"]) for i in range(4)], 1).astype(np.float64)
+    quats /= np.linalg.norm(quats, axis=1, keepdims=True).clip(1e-12)
+    return means, scales, quats
+
+
+def mahalanobis_assign(pts, means, scales, quats, k=16, chunk=200_000):
+    """Nearest Gaussian by Mahalanobis distance among the k Euclidean-nearest candidates."""
+    tree = cKDTree(means)
+    out = np.empty(pts.shape[0], dtype=np.int64)
+    w, x, y, z = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
+    R = np.stack([
+        1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], 1).reshape(-1, 3, 3)
+    inv_s2 = 1.0 / np.maximum(scales, 1e-8) ** 2
+    for s in range(0, pts.shape[0], chunk):
+        e = min(s + chunk, pts.shape[0])
+        _, idx = tree.query(pts[s:e], k=min(k, means.shape[0]), workers=-1)
+        idx = np.atleast_2d(idx)
+        d = pts[s:e, None, :] - means[idx]                      # (n,k,3) in world frame
+        loc = np.einsum('nkij,nkj->nki', R[idx].transpose(0, 1, 3, 2), d)   # -> Gaussian frame
+        m = (loc ** 2 * inv_s2[idx]).sum(-1)                    # Mahalanobis^2
+        out[s:e] = idx[np.arange(e - s), m.argmin(1)]
+    return out
+
+
+def run(outdir="artifacts/scannetpp/eval_gs", k_list=(20.0, 0.0), text_lowdin=False):
+    device = "cuda"
+    os.makedirs(outdir, exist_ok=True)
+    top, raw2bench = benchmark_map()
+    con = sqlite3.connect(DB, timeout=60.0)
+    for scene in SPP:
+        solved = f"{ART}/{scene}/solved_weighted_gs_unfroz_ogl3.pt"
+        if not os.path.exists(solved):
+            log(f"  [miss] gs {scene}"); continue
+        outp = os.path.join(outdir, f"{scene}_gs_unfroz.json")
+        if os.path.exists(outp):
+            log(f"  [skip] gs {scene}"); continue
+        t0 = time.time()
+        means, scales, quats = load_gaussians(scene)
+        sv = torch.load(solved, map_location="cpu", weights_only=True)
+        feats = sv["primitive_features"].float()
+        vmn = sv["valid_mask"].numpy()
+        P = feats.shape[0]
+        if means.shape[0] != P:
+            log(f"  [skip] gs {scene}: P mismatch {P} vs {means.shape[0]}"); continue
+        feats = feats.to(device)
+        vm = torch.from_numpy(vmn).to(device)
+        raw = torch.zeros_like(feats); raw[vm] = F.normalize(feats[vm], dim=-1)
+        del feats, sv
+        pos = torch.from_numpy(means).to(device).float()
+        mu = F.normalize(raw[vm].mean(0, keepdim=True), dim=-1)
+        cen = raw.clone(); cen[vm] = F.normalize(raw[vm] - LAM * mu, dim=-1)
+        # NON-renormalised centring. <u - lam*mu, t> = <u,t> - lam<mu,t>: the second term is constant
+        # across CLASSES, so plain argmax is provably identical either way. It is NOT identical
+        # through the stack, because CSLS's r_K(t_c) is a top-K mean over CELLS and that selection
+        # depends on per-cell scale. Renormalisation is what keeps features on the CLIP sphere; this
+        # arm measures what that costs (or buys) in the closed-set protocol.
+        cen_nr = raw.clone(); cen_nr[vm] = raw[vm] - LAM * mu
+        R = raw.norm(dim=-1) * vm            # no accumulator stats for this arm; ||f|| is Eq. 8's numerator
+        adj, off = knn_csr_safe(pos, vm, K=30)
+        Dm = int((off[1:] - off[:-1]).max()) + 1
+        chunk = max(256, 200_000 // max(Dm, 1))
+        cen_r = mode_vote_refine(cen, R, pos, adj, off, chunk=chunk)
+        raw_r = mode_vote_refine(raw, R, pos, adj, off, chunk=chunk)
+        cen_nr_r = mode_vote_refine(cen_nr, R, pos, adj, off, chunk=chunk)
+        src, dst, _ = csr_to_edges(adj, off, P, device)
+        ke = vm[src] & vm[dst]; src, dst = src[ke], dst[ke]
+        deg = torch.zeros(P, dtype=torch.long, device=device).index_add_(0, src, torch.ones_like(src))
+        del adj, off, R
+        torch.cuda.empty_cache()
+
+        gt_pts, gt_lab0, n_masked = load_gt(scene, top, raw2bench)
+        assigned = mahalanobis_assign(gt_pts.astype(np.float64), means, scales, quats)
+        assigned = np.where(vmn[assigned], assigned, -1)      # never own a point with an unseen Gaussian
+        owned = assigned >= 0
+        res = {"scene": scene, "recon": "gs_unfroz", "n_masked": n_masked,
+               "assignment": "mahalanobis", "arms": {}}
+        for ks in k_list:
+            if ks > 0:
+                a2 = np.where(owned, assigned, 0)
+                d = np.linalg.norm(gt_pts - means[a2], axis=1)
+                sub = means[vmn][::37] if vmn.sum() > 40_000 else means[vmn]
+                nn, _ = cKDTree(means[vmn]).query(sub, k=2)
+                spacing = float(np.median(nn[:, 1]))
+                keepc = (d <= ks * spacing) & owned
+                gt_lab = np.where(keepc, gt_lab0, -1); cov = float(keepc.mean()); tagc = f"cov{ks:g}"
+            else:
+                gt_lab = np.where(owned, gt_lab0, -1); cov = float(owned.mean()); tagc = "covNONE"
+            for K in (100, 50, 20):
+                present = sorted(set(np.unique(gt_lab).tolist()) & set(range(K)))
+                if not present: continue
+                nm = [top[:K][i] for i in present]
+                gt_t = torch.from_numpy(remap_gt_labels(gt_lab, present)).long()
+                txt = embed_class_names(nm, device); C = len(nm)
+                # Loewdin prototype orthogonalisation is REPRESENTATION-AGNOSTIC: it touches
+                # only the class embeddings, never the 3D field. Applied identically to every
+                # arm so the DELTA answers whether the representation changes how much a
+                # decorrelated classifier can actually exploit.
+                if text_lowdin:
+                    from run_text_and_pseudo_eval import text_lowdin as _lowdin
+                    txt = _lowdin(txt)
+                cs = f"spp_top{K}"
+                SURF = {"A_base", "F_full_stack", "B_normlift"}
+
+                def emit(cls_np, tag):
+                    mi, ma = score_pred(cls_np, assigned, owned, gt_t, C, gt_pts.shape[0])
+                    sm = {}
+                    if tag in SURF and K == 100 and ks > 0:
+                        pr = np.zeros(gt_pts.shape[0], dtype=np.int64)
+                        pr[owned] = cls_np[assigned[owned]] + 1
+                        try:
+                            sm = semantic_surface_metrics(gt_pts, gt_t.numpy(), pr, C + 1)
+                        except Exception as e:
+                            log(f"    [surf err] {tag}: {e}")
+                    res["arms"].setdefault(f"{tag}|{tagc}", {})[cs] = {
+                        "mIoU": mi, "mAcc": ma, "n_classes": C, "coverage": cov,
+                        "scd": sm.get("scd"), "hd95": sm.get("hd95"),
+                        "boundary_f1": sm.get("boundary_f1")}
+                    con.execute(
+                        "insert or replace into results_unified (scene,recon,features,solver,"
+                        "method,family,class_set,n_classes,miou,macc,coverage,grouping,complex,"
+                        "assignment,masked,scd,hd95,boundary_f1,mae_pred2gt,mae_gt2pred,n_missed,"
+                        "source,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (scene, "gs_unfroz", "ogl3", "weighted", f"{tag}|{tagc}", tagc, cs, C,
+                         mi, ma, cov, None, "knn30", "mahalanobis", 0,
+                         sm.get("scd"), sm.get("hd95"), sm.get("boundary_f1"),
+                         sm.get("mae_pred2gt"), sm.get("mae_gt2pred"), sm.get("n_missed"),
+                         "run_spp_gs_eval.py", time.time()))
+                    con.commit()
+
+                def cosof(u):
+                    c = torch.zeros(P, C, device=device); c[vm] = u[vm] @ txt.T; return c
+
+                emit(cosof(raw).argmax(-1).cpu().numpy(), "A_base")
+                emit(cosof(raw_r).argmax(-1).cpu().numpy(), "B_normlift")
+                emit(cosof(cen).argmax(-1).cpu().numpy(), "C_centre")
+                emit(cosof(cen_r).argmax(-1).cpu().numpy(), "D_centre_refine")
+                cc = csls(cosof(cen_r), vm)
+                emit(cc.argmax(-1).cpu().numpy(), "E_plus_csls")
+                p0 = rank_encode(cc, RANK_S, device); p0[~vm] = 0.0
+                emit(diffuse(p0, src, dst, deg, ALPHA, ITERS).argmax(-1).cpu().numpy(), "F_full_stack")
+                p0n = rank_encode(cosof(cen_r), RANK_S, device); p0n[~vm] = 0.0
+                emit(diffuse(p0n, src, dst, deg, ALPHA, ITERS).argmax(-1).cpu().numpy(), "G_stack_noCSLS")
+                # --- C1 WITHOUT the sphere renormalisation, same stack otherwise ---
+                emit(cosof(cen_nr).argmax(-1).cpu().numpy(), "H_centre_norenorm")
+                cc2 = csls(cosof(cen_nr_r), vm)
+                emit(cc2.argmax(-1).cpu().numpy(), "I_norenorm_csls")
+                p02 = rank_encode(cc2, RANK_S, device); p02[~vm] = 0.0
+                emit(diffuse(p02, src, dst, deg, ALPHA, ITERS).argmax(-1).cpu().numpy(),
+                     "J_full_stack_norenorm")
+                del txt, cc, p0, p0n, cc2, p02
+                torch.cuda.empty_cache()
+        with open(outp, "w") as fh:
+            json.dump(res, fh, indent=1)
+        log(f"  [ok] gs {scene} {time.time()-t0:.0f}s")
+        del raw, cen, cen_r, raw_r, src, dst, deg, pos
+        torch.cuda.empty_cache()
+
+
+if __name__ == "__main__":
+    from determinism import enable_determinism
+    enable_determinism()
+    import sys
+    kw = {}
+    if "--outdir" in sys.argv: kw["outdir"] = sys.argv[sys.argv.index("--outdir") + 1]
+    if "--text-lowdin" in sys.argv: kw["text_lowdin"] = True
+    run(**kw)
+    print("GS_EVAL DONE")

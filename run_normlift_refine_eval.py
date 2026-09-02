@@ -26,6 +26,7 @@ Evaluation follows THEIR protocol exactly: every primitive queried INDEPENDENTLY
 plain cosine argmax.
 """
 import argparse
+import os
 import json
 import sys
 
@@ -73,8 +74,27 @@ def build_knn_csr(positions, valid_mask_t, K=30, block=8192):
 
 def mode_vote_refine(unit, R, positions, adjacent, offsets, sigma_d=None,
                      tau=0.8, gamma=0.05, delta=0.1, chunk=8192):
-    """One conservative mode-voting pass. unit: (P,C) unit features (invalid rows zero);
-    R: (P,) reliability; returns refined unit features."""
+    """NEIGHBOURHOOD FEATURE CONSENSUS -- one conservative pass.
+
+    NAME WARNING (renamed 2026-08-31 after a coauthor review misread it, correctly, from the name):
+    this does NOT compute a mode over class labels. It never sees a class, a score, or a label. It
+    replaces a primitive's FEATURE VECTOR with a neighbour's FEATURE VECTOR when the neighbourhood
+    supports that neighbour more than it supports the primitive's own feature. The function name is
+    kept for backward compatibility with existing scripts and artifacts; the operation is
+    "neighbourhood feature consensus".
+
+    For each primitive i, over the candidate set {i} u neighbours(i):
+        a_j   = R_j * exp(-||pos_j - pos_i||^2 / (2 sigma_d^2))     voter weight
+        g_jk  = sigmoid((<u_j, u_k> - tau) / gamma)                 soft pairwise agreement
+        S_j   = R_j * sum_k g_jk a_k                                support for candidate j
+        u_i  <- u_argmax_j S_j    iff   max_{j != i} S_j > S_i + delta
+    so the update is a HARD COPY of an existing feature, never a blend -- deliberately, because
+    linear blending drifts off the CLIP manifold (NormLift's own ablation: 33.6% semantic drift).
+
+    unit: (P,C) unit features, invalid rows zero. R: (P,) reliability. positions: (P,3).
+    adjacent/offsets: CSR graph. Returns (P,C) refined unit features.
+    tau=0.8, gamma=0.05, delta=0.1; sigma_d defaults to the median neighbour distance.
+    """
     device = unit.device
     P = unit.shape[0]
     deg = (offsets[1:] - offsets[:-1])
@@ -154,7 +174,15 @@ def main():
     for scene in args.scenes.split(","):
         split = SCENES[scene]
         ckpt_dir = f"output/scannet_{scene}_{args.variant}"
-        stats_path = f"artifacts/scannet/{scene}/train_stats_sam_{args.variant}{args.suffix}.pt"
+        # Two naming conventions coexist: the original lift wrote
+        # `train_stats_sam_<variant><suffix>.pt`, while run_powerfoam_multisolver.py (which
+        # retained stats so the solver axis could be filled in without re-lifting) writes
+        # `stats_<variant>_ogl3.pt`. Accept either rather than duplicating multi-GB files.
+        cands = [
+            f"artifacts/scannet/{scene}/train_stats_sam_{args.variant}{args.suffix}.pt",
+            f"artifacts/scannet/{scene}/stats_{args.variant}{args.suffix}.pt",
+        ]
+        stats_path = next((c for c in cands if os.path.exists(c)), cands[0])
         adjacency_path = (f"artifacts/scannet/{scene}/adjacency_true_facet.pt"
                           if args.graph == "true_facet"
                           else f"artifacts/scannet/{scene}/adjacency_{args.variant}.pt")
@@ -173,7 +201,8 @@ def main():
 
         centers, radii = load_foam(ckpt_dir, device)
         positions = torch.from_numpy(centers).to(device).float()
-        import os
+        # (module-level `import os` at line 29 covers this; a local import here made
+        # `os` function-local, breaking the earlier stats-path lookup.)
         if not os.path.exists(adjacency_path):
             import subprocess
             if args.graph == "true_facet":

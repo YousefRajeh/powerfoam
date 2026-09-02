@@ -129,9 +129,17 @@ CREATE TABLE IF NOT EXISTS results (
     boundary_f1   REAL,                -- F1 under "nearest same-class point within 2cm"
     n_missed      INTEGER,             -- classes present in GT but never predicted; read
                                        -- WITH the distances, which exclude them
+    -- OpenGaussian/NormLift low-opacity GT masking, as an AXIS not a default. Their eval deletes
+    -- GT points whose primitive has opacity < 0.1, so our unmasked numbers are scored on points
+    -- the published baselines never scored. But the mask is wildly uneven across
+    -- representations (6.9% of points for pf_nonfroz vs 60.7% for rf_unfroz), so it converts
+    -- "left transparent geometry over a real surface" from a penalty into an exemption. Both
+    -- numbers are always recorded, with kept_fraction, so neither story can be told alone.
+    mask_opacity  REAL,                -- NULL = unmasked, else the threshold used
+    kept_fraction REAL,                -- share of GT points still scored after masking
     seconds       REAL,
     created_at    REAL,
-    UNIQUE (scene, recon, features, solver, grouping, class_set)
+    UNIQUE (scene, recon, features, solver, grouping, class_set, mask_opacity)
 );
 
 CREATE INDEX IF NOT EXISTS idx_results_scene   ON results(scene);
@@ -178,25 +186,26 @@ def record_failure(con, run_id, scene, recon, stage, detail):
     con.commit()
 
 
-def have_result(con, scene, recon, features, solver, grouping, class_set):
+def have_result(con, scene, recon, features, solver, grouping, class_set, mask_opacity=None):
     r = con.execute("SELECT 1 FROM results WHERE scene=? AND recon=? AND features=? AND "
-                    "solver=? AND grouping=? AND class_set=?",
-                    (scene, recon, features, solver, grouping, class_set)).fetchone()
+                    "solver=? AND grouping=? AND class_set=? AND mask_opacity IS ?",
+                    (scene, recon, features, solver, grouping, class_set, mask_opacity)).fetchone()
     return r is not None
 
 
 def put_result(con, run_id, scene, recon, features, solver, grouping, complex_, class_set,
-               n_classes, miou, macc, acc, per_class, seconds, surface=None):
+               n_classes, miou, macc, acc, per_class, seconds, surface=None,
+               mask_opacity=None, kept_fraction=None):
     sf = surface or {}
     con.execute(
         "INSERT OR REPLACE INTO results (run_id,scene,recon,features,solver,grouping,complex,"
         "class_set,n_classes,miou,macc,overall_acc,per_class,scd,mae_pred2gt,mae_gt2pred,"
-        "hd95,boundary_f1,n_missed,seconds,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "hd95,boundary_f1,n_missed,mask_opacity,kept_fraction,seconds,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (run_id, scene, recon, features, solver, grouping, complex_, class_set, n_classes,
          miou, macc, acc, json.dumps(per_class), sf.get("scd"), sf.get("mae_pred2gt"),
          sf.get("mae_gt2pred"), sf.get("hd95"), sf.get("boundary_f1"), sf.get("n_missed"),
-         seconds, time.time()))
+         mask_opacity, kept_fraction, seconds, time.time()))
     con.commit()
 
 

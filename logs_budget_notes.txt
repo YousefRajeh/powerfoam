@@ -1,0 +1,1 @@
+[note] 2.1M RadFoam lift exceeds GPU memory (~46GB for 2.03M prims x 512 dims across 4 accumulator buffers). Point-budget question already settled on PowerFoam; not engineering around this.

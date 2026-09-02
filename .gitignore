@@ -44,3 +44,9 @@ configs/_tf_*.yaml
 # Orchestration scripts are versioned deliberately; scratch *.sh above stays ignored.
 !scripts/remote/*.sh
 /recon_remote
+
+# session artifacts: multi-GB checkpoints, stats and result dumps
+artifacts/
+output/
+recon_lerf_gs/
+recon_remote/

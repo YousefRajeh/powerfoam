@@ -1,0 +1,70 @@
+# Frozen-point-cloud training, matching OpenGaussian's --frozen_init_pts convention for
+# ScanNet: init_points/final_points get set equal (via CLI --init_points/--final_points
+# overrides, one value per scene, since each scene's real SfM/GT point count differs) and
+# densify_from/densify_until=0 disables densification/pruning for the whole run (see
+# train.py's densify guard: `if i >= densify_from and i < densify_until` is never true when
+# both are 0). Combined with scene.py::init_points_sfm's new "num_points >= available ->
+# return them all directly" branch, this uses the scene's exact point cloud unchanged for the
+# entire 30k-iteration run, the PowerFoam-side analogue of OpenGaussian's frozen Gaussians
+# (though PowerFoam doesn't NEED this for evaluation -- point_cloud_query.py's power-cell
+# membership works on any checkpoint -- this run exists to directly test whether freezing
+# vs. not freezing affects reconstruction/rendering quality and the downstream point-mIoU).
+#
+# IMPORTANT: points_lr_init/final are ALSO 0.0 below (not just densify disabled). Verified
+# directly against OpenGaussian's own scene/gaussian_model.py: `if training_args.frozen_init_pts:
+# self._xyz = self._xyz.detach()` -- their "frozen" means positions are completely detached from
+# the gradient (never move at all via backprop either), not just "never split/cloned/pruned".
+# An earlier version of this config only disabled densify_from/until and left points_lr active
+# (1e-3 -> 5e-5), so primitives still drifted via gradient descent every iteration -- a real,
+# caught discrepancy from OpenGaussian's actual convention, not an intentional design choice.
+# All 10 ScanNet scenes' "frozen" checkpoints trained before this fix need to be redone.
+
+# Experiment parameters
+iterations: 30000
+densify_from: 0
+densify_until: 0
+normal_weight: 0.1
+contribution_weight: 0.1
+interpenetration_weight: 1e-4
+
+# Dataset parameters
+dataset: "colmap"
+data_path: "D:/Downloads/spp_data_1600"
+scene: "0d2ee665be"
+alpha_format_on_disk: "straight"
+downsample: [1, 1]
+downsample_iterations: [0, 500]
+is_pinhole: true
+eval: false
+
+# Model parameters
+init_type: "sfm"
+init_points: 31609
+final_points: 31609
+bkgd_color: [0.0, 0.0, 0.0]
+render_objective: "volume"
+sv_dof: 8
+num_texel_sites: 8
+
+# Optimization parameters
+points_lr_init: 0.0
+points_lr_final: 0.0
+density_lr_init: 1e0
+density_lr_final: 1e0
+radii_lr_init: 5e-5
+radii_lr_final: 5e-6
+quaternions_lr_init: 1e-1
+quaternions_lr_final: 1e-2
+texel_sites_lr_init: 1e-2
+texel_sites_lr_final: 1e-3
+texel_sv_axis_lr_init: 5e-2
+texel_sv_axis_lr_final: 5e-3
+texel_sv_rgb_lr_init: 5e-3
+texel_sv_rgb_lr_final: 5e-4
+texel_height_lr_init: 5e-3
+texel_height_lr_final: 5e-4
+
+# Gate the resample/sort_points block that silently churned the point set (train.py:507).
+# points_lr=0 and densify off are NOT sufficient on their own -- see patch_powerfoam_freeze.py.
+freeze_points: true
+experiment_name: "spp_pf_truefrozen_0d2ee665be"

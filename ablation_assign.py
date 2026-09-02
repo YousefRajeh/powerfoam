@@ -36,6 +36,14 @@ RECONS = {
     "rf_unfroz":  ("radfoam",   "recon_remote/rf_unfroz/{scene}/model.pt"),
     "gs_froz":    ("gaussian",  "recon_remote/gs_froz/{scene}/ckpt.pt"),
     "gs_unfroz":  ("gaussian",  "recon_remote/gs_unfroz/{scene}/ckpt.pt"),
+    # 20k arms: radfoam's OWN schedule (iterations 20_000, freeze_points 18_000), against the
+    # 30k we imposed to "match PowerFoam". Measured on scene0062_00, the extra 10k iterations
+    # cost 14.6 points of vacuum fraction (sigma<1e-6: 22.7% -> 37.3%) for 1.5 dB of PSNR,
+    # which propagated to -4.10 mIoU. Naming note: the remote experiment tag was rf20k_match_*
+    # ("matched to PowerFoam"); it is renamed rf20k_froz_* so one word means frozen at every
+    # layer -- remote tag, config, local directory, and ablation arm.
+    "rf20k_froz":   ("radfoam", "recon_remote/rf20k_froz/{scene}/model.pt"),
+    "rf20k_unfroz": ("radfoam", "recon_remote/rf20k_unfroz/{scene}/model.pt"),
 }
 
 
