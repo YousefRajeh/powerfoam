@@ -77,9 +77,26 @@ def save(stage, payload, complete=True):
     print(f"  [saved] {path(stage)}", flush=True)
 
 
+# The 3DGS arms JIT-compile a CUDA extension, which needs MSVC's `cl` on PATH. Without it the
+# failure is `subprocess.CalledProcessError: Command '['where', 'cl']' returned non-zero exit
+# status 1` from deep inside torch's cpp_extension -- which reads like a torch bug rather than a
+# missing compiler. Injecting the path here means the run does not have to start from a Visual
+# Studio developer prompt, which is the kind of precondition that gets forgotten at 2am.
+MSVC_BIN = (r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools"
+            r"\MSVC\14.44.35207\bin\Hostx64\x64")
+
+
+def env_with_msvc():
+    env = dict(os.environ)
+    if os.path.exists(os.path.join(MSVC_BIN, "cl.exe")):
+        env["PATH"] = MSVC_BIN + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def sh(cmd, tag, timeout=None):
     t0 = time.time()
-    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
+                       env=env_with_msvc())
     dt = (time.time() - t0) / 60
     ok = r.returncode == 0
     print(f"  [{tag}] {'ok' if ok else 'FAILED rc=%d' % r.returncode} ({dt:.1f} min)", flush=True)
@@ -219,8 +236,14 @@ def main():
         t0 = time.time()
         try:
             res = STAGES[st][0](a.smoke)
-            save(st if not a.smoke else st + "_smoke", res, complete=not a.smoke)
-            summary[st] = f"ok ({(time.time()-t0)/60:.1f} min)"
+            # "the stage function returned" is NOT "the stage produced numbers": a sub-run can fail
+            # and the stage still returns {"error": ...} or an empty dict. Reporting that as ok is
+            # how a night silently produces nothing -- the summary is the only thing read in the
+            # morning, so it has to distinguish.
+            empty = (not res) or (isinstance(res, dict) and "error" in res)
+            save(st if not a.smoke else st + "_smoke", res, complete=(not a.smoke) and not empty)
+            summary[st] = (f"NO RESULTS ({(time.time()-t0)/60:.1f} min) -- see log"
+                           if empty else f"ok ({(time.time()-t0)/60:.1f} min)")
         except Exception as exc:                          # noqa: BLE001
             print(f"  [{st}] EXCEPTION {type(exc).__name__}: {exc}", flush=True)
             traceback.print_exc()
