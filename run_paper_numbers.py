@@ -147,8 +147,90 @@ def stage_spp_surface(smoke):
     return json.load(open(out)) if ok and os.path.exists(out) else {"error": "see log"}
 
 
+def stage_lerf_relift(smoke):
+    """Re-lift features onto the checkpoints the PAPER reports, so tab:2dseg and tab:lerf describe
+    the same reconstruction.
+
+    THE MISMATCH THIS FIXES. tab:lerf's PSNRs come from `output/lerf_ovs_{scene}` (figurines 26.47,
+    ramen 34.49, teatime 30.19, waldo 32.31 -- verified against each metrics.txt). The only solved
+    features on disk are 499,999 primitives, i.e. `lerf_ovs_figurines_500k_bothfixes`, a DIFFERENT
+    reconstruction. Scoring segmentation on one reconstruction and reporting PSNR for another is
+    the same apples-to-oranges confound removed from Table 4 today.
+
+    Fixed in the direction that keeps the published numbers: re-lift onto the reported checkpoints
+    rather than restate the PSNR row. A new geometry invalidates every cached feature file, so this
+    is accumulate + solve per scene, not a re-score.
+    """
+    scenes = LERF[:1] if smoke else LERF
+    res = {}
+    for s in scenes:
+        ck = f"output/lerf_ovs_{s}"
+        feat = f"artifacts/lerf_ovs/{s}/openclip_train"
+        work = f"artifacts/lerf_ovs/{s}/relift_paperckpt"
+        solved = os.path.join(work, "solved.pt")
+        if not os.path.exists(f"{ck}/model.pt"):
+            print(f"  [MISS] {s}: no {ck}/model.pt", flush=True)
+            continue
+        if os.path.exists(solved) and not smoke:
+            res[s] = {"solved": solved, "reused": True}
+            print(f"  [skip] {s} already re-lifted", flush=True)
+            continue
+        os.makedirs(work, exist_ok=True)
+        ok, _ = sh([PY, "relift_and_score.py", "--ckpt-dirs", ck, "--scene", s,
+                    "--feature-dir", feat, "--sam-level", "0", "--lift-only",
+                    "--out", os.path.join(work, "relift.json")], f"relift {s}")
+        # relift_and_score writes under artifacts/scannet/relift/<ckptname>/; eval_lerf_iou.py
+        # reads artifacts/lerf_ovs/<scene>/solved_weighted.pt. Put it where the evaluator looks,
+        # but KEEP the old 500k features under their own name -- they are a real reconstruction's
+        # features and overwriting them silently would destroy the only copy.
+        src = os.path.join("artifacts/scannet/relift", os.path.basename(ck), "solved.pt")
+        dst = f"artifacts/lerf_ovs/{s}/solved_weighted.pt"
+        if ok and os.path.exists(src):
+            import shutil
+            if os.path.exists(dst) and not os.path.exists(dst.replace(".pt", "_500k_bothfixes.pt")):
+                shutil.move(dst, dst.replace(".pt", "_500k_bothfixes.pt"))
+                print(f"  [kept] previous features -> {dst.replace('.pt', '_500k_bothfixes.pt')}",
+                      flush=True)
+            shutil.copyfile(src, dst)
+            print(f"  [placed] {dst}", flush=True)
+        res[s] = {"ok": ok, "ckpt": ck, "solved": dst if ok else None}
+    return res
+
+
+def stage_lerf_gs(smoke):
+    """tab:lerf (10 cells) + tab:recon LERF rows -- train 3DGS on the missing LERF scenes, then
+    PSNR/SSIM under the same protocol as the foam arm.
+
+    Only `figurines` has a checkpoint; ramen/teatime/waldo_kitchen have training logs but no model.
+    `train_lerf_gs.sh` already skips completed scenes, so this trains exactly the missing three.
+    Protocol is matched to foam's LERF configs in that script: native resolution, no held-out
+    split (foam's `eval: false`), 30k steps.
+    """
+    if smoke:
+        print("  [smoke] skipping 3DGS training (hours); checking prerequisites only", flush=True)
+        trainer = r"D:\Downloads\splat-distiller\gaussian_splatting\simple_trainer.py"
+        return {"trainer_present": os.path.exists(trainer),
+                "data_present": os.path.isdir("data/lerf_ovs_raw/lerf_ovs"),
+                "already_trained": [s for s in LERF
+                                    if os.path.exists(f"recon_lerf_gs/{s}/ckpts/ckpt_29999_rank0.pt")]}
+    ok, _ = sh(["bash", "train_lerf_gs.sh"], "train-3dgs-lerf")
+    trained = [s for s in LERF if os.path.exists(f"recon_lerf_gs/{s}/ckpts/ckpt_29999_rank0.pt")]
+    res = {"trained": trained, "train_ok": ok}
+    out = "artifacts/lerf_ovs/gs_psnr.json"
+    ok2, _ = sh([PY, "eval_lerf_gs_psnr.py", "--output", out], "lerf-gs-psnr")
+    if ok2 and os.path.exists(out):
+        res["psnr"] = json.load(open(out))
+    return res
+
+
 def stage_lerf2d(smoke):
-    """tab:2dseg -- LERF-OVS 2D relevancy IoU/Acc/locAcc, our row."""
+    """tab:2dseg -- LERF-OVS 2D relevancy IoU/Acc/locAcc, our row.
+
+    Depends on `lerf_relift`: the evaluator pairs `output/lerf_ovs_{scene}` with
+    `artifacts/lerf_ovs/{scene}/solved_weighted.pt`, and those disagreed on primitive count
+    (800,000 vs 499,999), which is why it failed with `X must have shape [num_primitives,
+    channels]`. Once the re-lift has written features for the reported checkpoint they match.
+    """
     scenes = LERF[:1] if smoke else LERF
     res = {}
     for s in scenes:
@@ -186,12 +268,16 @@ def stage_adjacency(smoke):
     return degs
 
 
+# ORDER MATTERS: cheap-and-certain first so a night that dies early still banks something, and
+# lerf_relift before lerf2d because lerf2d consumes its output.
 STAGES = {
-    "beta":        (stage_beta,        "tab:matched, 12 cells -- beta for 6 remaining scenes x 2 arms"),
-    "table4_mesh": (stage_table4_mesh, "tab:3dseg REDO -- per-cell argmax + MESH surface, 4 arms x 10 scenes"),
+    "adjacency":   (stage_adjacency,   "tab:adjacency -- PowerFoam mean facet degree (seconds)"),
     "spp_surface": (stage_spp_surface, "tab:3dseg_spp, 18 cells -- ScanNet++ surface, per-cell argmax"),
-    "lerf2d":      (stage_lerf2d,      "tab:2dseg, 15 cells -- LERF-OVS 2D, our row"),
-    "adjacency":   (stage_adjacency,   "tab:adjacency -- PowerFoam mean facet degree"),
+    "table4_mesh": (stage_table4_mesh, "tab:3dseg REDO -- per-cell argmax + MESH surface, 4 arms x 10 scenes"),
+    "beta":        (stage_beta,        "tab:matched, 12 cells -- beta for 6 remaining scenes x 2 arms"),
+    "lerf_relift": (stage_lerf_relift, "re-lift LERF features onto the checkpoints the paper reports"),
+    "lerf2d":      (stage_lerf2d,      "tab:2dseg, 15 cells -- LERF-OVS 2D, our row (needs lerf_relift)"),
+    "lerf_gs":     (stage_lerf_gs,     "tab:lerf 10 + tab:recon -- train 3DGS on 3 LERF scenes, then PSNR/SSIM (HOURS)"),
 }
 
 BLOCKED = [

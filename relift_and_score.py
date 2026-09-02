@@ -178,6 +178,11 @@ def main():
     ap.add_argument("--feature-dir",
                     default=r"data\scannet\scene0347_00_colmap\openclip_features_sam_l3")
     ap.add_argument("--sam-level", type=int, default=0)
+    ap.add_argument("--lift-only", action="store_true",
+                    help="accumulate + solve, then stop. `score()` reads ScanNet's Pointcept GT and "
+                         "is meaningless for LERF, which is scored by eval_lerf_iou.py against "
+                         "polygon masks instead. Without this the lift succeeds and then dies on "
+                         "KeyError: 'figurines' -- work done, nothing reported.")
     ap.add_argument("--out", default="artifacts/scannet/relift_percell.json")
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -189,6 +194,12 @@ def main():
         os.makedirs(work, exist_ok=True)
         solved = lift(ckpt, a.scene, a.feature_dir, work, a.sam_level)
         if solved is None:
+            continue
+        if a.lift_only:
+            results[name] = {"solved": solved, "lift_only": True}
+            print(f"  [lift-only] {solved}", flush=True)
+            os.makedirs(os.path.dirname(a.out), exist_ok=True)
+            json.dump(results, open(a.out, "w"), indent=2)
             continue
         results[name] = score(ckpt, solved, a.scene, dev)
         os.makedirs(os.path.dirname(a.out), exist_ok=True)
