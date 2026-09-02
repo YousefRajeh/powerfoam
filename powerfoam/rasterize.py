@@ -760,6 +760,8 @@ class Rasterizer:
             feature_heat_out: wp.array2d(dtype=wp.float32),
             feature_pca_out: wp.array2d(dtype=wp.vec3f),
             front_prim_idx_out: wp.array2d(dtype=wp.int32),
+            front_t_surf_out: wp.array2d(dtype=wp.float32),
+            front_t_entry_out: wp.array2d(dtype=wp.float32),
         ):
             thread_idx = wp.tid()
             tile_idx = thread_idx // TILE_SIZE
@@ -795,6 +797,14 @@ class Rasterizer:
             n_intersections_hit = int(0)
             front_prim_idx = int(-1)
             front_weight = float(0.0)
+            # Surface geometry of the front primitive, for surface extraction.
+            # `t_surf`  is where the ray meets that primitive's DISPLACED DIPOLE PLANE.
+            # `t_entry` is where the ray enters its matter, i.e. the segment's t_near after both
+            #           the power-facet clipping and the dipole clipping. The two coincide only
+            #           when the dipole is the entry face (dp < 0); when the ray enters through a
+            #           power facet the boundary there belongs to the neighbour, not to this cell.
+            front_t_surf = float(0.0)
+            front_t_entry = float(0.0)
 
             prim_offset_start = tile_prim_indices_offsets[tile_idx]
             prim_offset_end = tile_prim_indices_offsets[tile_idx + 1]
@@ -880,6 +890,8 @@ class Rasterizer:
                     if alpha * trans > front_weight:
                         front_weight = alpha * trans
                         front_prim_idx = prim_idx
+                        front_t_surf = t_surf
+                        front_t_entry = t_near
                     log_t += delta_log_t
 
                     if not depth_quantile_found:
@@ -903,6 +915,8 @@ class Rasterizer:
                 feature_heat_out[pix_i, pix_j] = feature_heat_acc
                 feature_pca_out[pix_i, pix_j] = feature_pca_acc
                 front_prim_idx_out[pix_i, pix_j] = front_prim_idx
+                front_t_surf_out[pix_i, pix_j] = front_t_surf
+                front_t_entry_out[pix_i, pix_j] = front_t_entry
 
         self.visualization_kernel = visualization_kernel
 
@@ -2374,6 +2388,16 @@ class Rasterizer:
                 dtype=torch.int32,
                 device=self.device,
             )
+            front_t_surf_out = torch.zeros(
+                (camera.height, camera.width),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            front_t_entry_out = torch.zeros(
+                (camera.height, camera.width),
+                dtype=torch.float32,
+                device=self.device,
+            )
 
             tile_inter_counts = torch.zeros(
                 total_tiles + 1, dtype=torch.int32, device=self.device
@@ -2461,10 +2485,15 @@ class Rasterizer:
                     feature_heat_out,
                     feature_pca_out,
                     front_prim_idx_out,
+                    front_t_surf_out,
+                    front_t_entry_out,
                 ],
                 block_dim=TILE_SIZE,
             )
 
+            # NOTE: the two front-surface outputs are APPENDED, never inserted. Every caller
+            # indexes this tuple positionally (result[1] for depth, result[3] for alpha), so
+            # adding at the end is backward compatible; inserting would silently break them.
             return (
                 color_out,
                 depth_out,
@@ -2474,6 +2503,8 @@ class Rasterizer:
                 feature_heat_out,
                 feature_pca_out,
                 front_prim_idx_out,
+                front_t_surf_out,
+                front_t_entry_out,
             )
 
     def export_operator(
