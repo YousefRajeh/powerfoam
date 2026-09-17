@@ -157,6 +157,8 @@ def main():
     ap.add_argument("--arms", default="pf_truefrozen")
     ap.add_argument("--views", type=int, default=12)
     ap.add_argument("--cap", type=int, default=512)
+    ap.add_argument("--cat-on-cpu", action="store_true",
+                    help="stage per-view operator pieces on host RAM; needed for dense arms")
     ap.add_argument("--out", default="artifacts/scannet/eh_magnitude.json")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
@@ -183,18 +185,33 @@ def main():
             if (arm, sc) in done:
                 print(f"[{arm}/{sc}] cached", flush=True); continue
             t0 = time.time()
-            row, col, val, gid, Treg, P, R, _ = XB.build(sc, arm, a.views, a.cap, dev)
+            row, col, val, gid, Treg, P, R, _ = XB.build(sc, arm, a.views, a.cap, dev,
+                                                         cat_on_cpu=a.cat_on_cpu)
             nnz = val.numel(); d = Treg.shape[1]
             if not bool((row[1:] >= row[:-1]).all()):
                 o = torch.argsort(row)
                 row = row[o].contiguous(); col = col[o].contiguous(); val = val[o].contiguous()
                 del o; torch.cuda.empty_cache()
 
+            # Chunked float64 scatter. Under enable_determinism() index_add_ uses a SORT-based
+            # kernel whose workspace scales with the input: at ~5e8 non-zeros it wants ~12 GB, which
+            # OOM'd this script twice. Chunking bounds the workspace; the float64 accumulator makes
+            # the result independent of the chunk size rather than silently order-dependent.
+            # (Same fix as bound_delta and measure_conditioning -- it is a systemic constraint of
+            # deterministic scatter, not a per-script quirk.)
+            SC = 100_000_000
+            def scat(nout, idx, src):
+                acc = torch.zeros(nout, device=dev, dtype=torch.float64)
+                for s0 in range(0, idx.numel(), SC):
+                    e0 = min(s0 + SC, idx.numel())
+                    acc.index_add_(0, idx[s0:e0], src[s0:e0].double())
+                return acc.float()
+
             # PASS 1: column masses D and row masses r (independent reductions, same sweep)
-            D = torch.zeros(P, device=dev).index_add_(0, col, val)
-            r = torch.zeros(R, device=dev).index_add_(0, row, val)
+            D = scat(P, col, val)
+            r = scat(R, row, val)
             # PASS 2: A^T r -- cannot start before r is complete
-            Atr = torch.zeros(P, device=dev).index_add_(0, col, val * r[row])
+            Atr = scat(P, col, val * r[row])
 
             # Chunk must be sized by CHANNEL WIDTH, not copied from the class-space scripts. This
             # runs in FEATURE space (d = 512), so an 8M-row chunk gathers 8M x 512 x 4 B = 16 GB and
