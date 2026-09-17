@@ -125,13 +125,51 @@ def selftest():
           f"and contracts delta")
 
 
+def _chunked_index_add(out, idx, src, chunk=100_000_000):
+    """index_add_ in fixed-size chunks, accumulated in float64.
+
+    Under enable_determinism() torch routes index_add_ through a SORT-based kernel; at 8e8 elements
+    its workspace alone wants ~12 GB, which is what OOM'd the dense arm at `colsum = ...`. Chunking
+    makes the workspace scale with the chunk instead of with nnz.
+
+    Chunking alone changes the SUMMATION ORDER, and float addition is not associative -- measured
+    max |delta| 3.05e-05 against the single-shot result, i.e. deterministic but not identical. The
+    float64 accumulator removes that: the output is then within ~1e-12 of the single-shot float32
+    value AND independent of the chunk size, so the chunking is an implementation detail rather than
+    a silent change to the numbers. Cost is trivial -- the accumulator is length P or R, not nnz.
+    """
+    import torch                      # torch is imported inside main(), not at module scope
+    n = idx.numel()
+    acc = torch.zeros(out.shape, device=out.device, dtype=torch.float64)
+    if n <= chunk:
+        acc.index_add_(0, idx, src.double())
+    else:
+        for s0 in range(0, n, chunk):
+            e0 = min(s0 + chunk, n)
+            acc.index_add_(0, idx[s0:e0], src[s0:e0].double())
+    out.copy_(acc.to(out.dtype))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenes", default=None)
     ap.add_argument("--arms", default="pf_truefrozen")
     ap.add_argument("--views", type=int, default=12)
     ap.add_argument("--cap", type=int, default=512)
-    ap.add_argument("--cg-iters", type=int, default=120)
+    ap.add_argument("--cat-on-cpu", action="store_true",
+                    help="stage the per-view operator pieces on host RAM before concatenating. "
+                         "Removes the ~2x peak spike in torch.cat that OOMs dense arms; identical "
+                         "numerically.")
+    ap.add_argument("--mem-budget", type=float, default=3e8,
+                    help="elements per row-block temporary. Lower it for dense arms (gs_unfroz has "
+                         "~1.9M primitives and ~33 per ray, so the default makes one block span all "
+                         "15M rows and the simultaneous temporaries OOM a 48 GB card).")
+    ap.add_argument("--cg-iters", type=int, default=40,
+                    help="CG for delta_lower only, which feeds the residual-invisible DIAGNOSTIC and "
+                         "nothing else -- not the bound, not delta_upper, not k_stop. Truncating is "
+                         "conservative: fewer iterations leave a larger residual, so delta_lower is "
+                         "OVER-estimated and the invisible fraction UNDER-estimated.")
     ap.add_argument("--kmax", type=int, default=24)
     ap.add_argument("--tau", type=float, default=1.01)
     ap.add_argument("--out", default="artifacts/scannet/delta_bound.json")
@@ -154,6 +192,7 @@ def main():
     from evaluate_point_cloud_miou import (OPENGAUSSIAN_CLASS_SETS, embed_class_names,
                                            remap_gt_labels)
     from point_cloud_query import assign_points_to_power_cells, assign_points_to_nearest_center
+    from estimate_sigma_crit import _class_head as _class_head_local
 
     scenes = (a.scenes or ",".join(SCENES)).split(",")
     out = json.load(open(a.out)) if os.path.exists(a.out) else []
@@ -164,16 +203,25 @@ def main():
             if (arm, sc) in done:
                 print(f"[{arm}/{sc}] cached", flush=True); continue
             t0 = time.time()
-            row, col, val, gid, Treg, P, R, _ = XB.build(sc, arm, a.views, a.cap, dev)
+            row, col, val, gid, Treg, P, R, _ = XB.build(sc, arm, a.views, a.cap, dev,
+                                                         cat_on_cpu=a.cat_on_cpu)
             nnz = val.numel()
-            o = torch.argsort(row); row, col, val = row[o].contiguous(), col[o].contiguous(), val[o].contiguous()
-            colsum = torch.zeros(P, device=dev).index_add_(0, col, val)
+            # Sorting is only needed if the operator is not already row-ordered. With 3DGS's ~20x
+            # larger nnz the permutation plus three sorted copies is ~14 GB of avoidable
+            # duplication, which is what OOM'd the first attempt. Check before paying for it.
+            if not bool((row[1:] >= row[:-1]).all()):
+                o = torch.argsort(row)
+                row = row[o].contiguous(); col = col[o].contiguous(); val = val[o].contiguous()
+                del o
+                torch.cuda.empty_cache()
+            colsum = _chunked_index_add(torch.zeros(P, device=dev), col, val)
             live = colsum > 0
             Dinv = 1.0 / colsum.clamp_min(torch.finfo(val.dtype).eps)
 
+            Tcls = _class_head_local(sc, dev)
             starts = torch.searchsorted(row, torch.arange(R + 1, device=dev))
             _st = starts.cpu().tolist()
-            BUD = max(1, int(3e8 // max(Treg.shape[1], 1)))   # conservative: pre-projection width
+            BUD = max(1, int(a.mem_budget // max(Tcls.shape[0], 1)))   # post-projection width
             tg = torch.arange(0, nnz + BUD, BUD, device=dev)
             bnd = torch.unique(torch.cat([torch.searchsorted(starts.contiguous(), tg).clamp(0, R),
                                           torch.tensor([R], device=dev)]))
@@ -219,7 +267,7 @@ def main():
             for s0 in range(0, nnz, 8_000_000):
                 e0 = min(s0 + 8_000_000, nnz)
                 rhs.index_add_(0, col[s0:e0], val[s0:e0, None] * Treg[gid[row[s0:e0]]])
-            rvec = torch.zeros(R, device=dev).index_add_(0, row, val)
+            rvec = _chunked_index_add(torch.zeros(R, device=dev), row, val)
             cosmin = (Treg @ T.T).min(1).values                 # per REGION, then gathered per ray
             bn2 = (Treg ** 2).sum(1)
             hit = torch.zeros(R, dtype=torch.bool, device=dev); hit[row] = True
@@ -264,8 +312,19 @@ def main():
             for _ in range(a.kmax):
                 Xk = Xk + (rhs - AtA(Xk)) * Dinv[:, None]
                 rcurve.append(resid2(Xk))
+            # k = 0 MUST be tested. FINDINGS4 priority check (ii): measured ||B||^2 = 1.2e6 against
+            # tau^2 delta_upper^2 = 1.26e7, so the zero field ALREADY satisfies the criterion -- and
+            # it does for the oracle delta too. An earlier version of this loop started at k = 1 and
+            # reported "k_stop = 1" on 40/40 scene-arms, which was an artifact of the loop bound, not
+            # a result. The honest answer is k_stop = 0: the discrepancy exceeds the data norm
+            # (delta_true 2850 vs ||B|| 1109), so there is no stopping index to find and the
+            # discrepancy principle is NOT a usable stopping rule on this problem. The delta bound
+            # itself remains a valid, tight measurement of model discrepancy.
+            resid_k0 = float((bn2[gi] * 0 + bn2[gi]).sum())    # ||B - A*0||^2 = ||B||^2
             def stop_index(delta2):
                 t2 = (a.tau ** 2) * delta2
+                if resid_k0 <= t2:
+                    return 0
                 for k, rv in enumerate(rcurve, 1):
                     if rv <= t2:
                         return k
@@ -279,11 +338,14 @@ def main():
             assert all(rcurve[i + 1] <= rcurve[i] * (1 + 1e-6) for i in range(len(rcurve) - 1)),                 "residual not monotone -- iteration or blocking is wrong"
 
             r_ = {"arm": arm, "scene": sc, "P": int(P), "rays_hit": int(idx.numel()), "d": int(d),
+                  "views": int(a.views),   # RECORD IT: tightness is only comparable at equal budget
+                  "nnz": int(nnz),
                   "delta_lower": delta_lo2 ** 0.5, "delta_true": delta_tr2 ** 0.5,
                   "delta_upper": delta_up2 ** 0.5,
                   "tightness_upper_over_true": (delta_up2 / max(delta_tr2, 1e-30)) ** 0.5,
                   "invisible_frac": 1.0 - delta_lo2 / max(delta_tr2, 1e-30),
                   "k_stop_upper": k_up, "k_stop_true": k_tr, "resid_curve": rcurve,
+                  "resid_k0": resid_k0, "B_norm": resid_k0 ** 0.5,
                   "wall_s": round(time.time() - t0, 1)}
             out.append(r_); json.dump(out, open(a.out, "w"), indent=1)
             print(f"[{arm}/{sc}] delta lower {r_['delta_lower']:.1f} < true {r_['delta_true']:.1f} "

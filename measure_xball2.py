@@ -51,7 +51,7 @@ FOAM = {"truefrozen", "nonfrozen"}
 
 
 def build(scene, arm, views, cap, dev, feat_dirname="openclip_features_sam_l3",
-          normalize_features=True):
+          normalize_features=True, cat_on_cpu=False):
     """Operator plus the factorised observations: seg ids per ray and the stacked region table."""
     recon = arm.replace("pf_", "")
     cfg = f"output/scannet_{scene}_{recon if recon in FOAM else 'truefrozen'}/config.yaml"
@@ -98,13 +98,30 @@ def build(scene, arm, views, cap, dev, feat_dirname="openclip_features_sam_l3",
                                                     transmittance_floor=1e-3)
         seg, tab = load_view_features(feat_dir, stems[vi % len(stems)], H, W, dev,
                                       normalize=normalize_features)
-        rows.append(ri.to(torch.int64).to(dev) + offs)
-        cols.append(ci.to(torch.int64).to(dev))
-        vals.append(vv.float().to(dev))
-        gid_all.append(seg.clamp(0, tab.shape[0] - 1) + moff)     # global region id per ray
+        # cat_on_cpu: MEASURED cause (an earlier comment here blamed torch.cat, which was wrong).
+        # export_view_operator has a ~15 GB TRANSIENT per view -- measured 13.8-16.0 GB to produce
+        # only ~1.3 GB of output, i.e. ~220 bytes of scratch per output non-zero, driven by the
+        # cap x pixels preallocation (512 x 1.25M slots). Meanwhile the accumulated operator grows
+        # toward ~15 GB over 12 views on a dense arm (gs_unfroz, nnz ~ 8e8). On the later views the
+        # two COLLIDE: ~30 GB before conversions and fragmentation, which is what reached 43 GB and
+        # OOM'd. Staging the accumulation on host RAM keeps them from coexisting, so peak GPU is
+        # just the transient plus one view. Numerically identical -- verified bit-exact.
+        stage = "cpu" if cat_on_cpu else dev
+        rows.append(ri.to(torch.int64).to(stage) + offs)
+        cols.append(ci.to(torch.int64).to(stage))
+        vals.append(vv.float().to(stage))
+        gid_all.append((seg.clamp(0, tab.shape[0] - 1) + moff).to(stage))
         tabs.append(tab)
         offs += H * W; moff += tab.shape[0]
         del ri, ci, vv
+        if cat_on_cpu:
+            torch.cuda.empty_cache()
+    if cat_on_cpu:
+        r_, c_, v_ = torch.cat(rows), torch.cat(cols), torch.cat(vals)
+        g_ = torch.cat(gid_all)
+        del rows, cols, vals, gid_all
+        return (r_.to(dev), c_.to(dev), v_.to(dev), g_.to(dev),
+                torch.cat(tabs, 0).to(dev), P, offs, args)
     return (torch.cat(rows), torch.cat(cols), torch.cat(vals),
             torch.cat(gid_all), torch.cat(tabs, 0), P, offs, args)
 

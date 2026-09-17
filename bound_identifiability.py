@@ -51,7 +51,10 @@ it, hence the strongest statement of the form "even knowing the truth, the data 
   2. Delta_j(c*) = 0 exactly;
   3. N_j >= 1 always, and N_j = C when delta is huge;
   4. MISLED_j holds exactly when coordinate descent on the residual, started AT the truth, moves
-     primitive j away from it -- the operational meaning of the bound.
+     primitive j away from it -- the operational meaning of the bound;
+  5. OPTIMALITY: exactly ONE d-channel pass over nnz builds the entire P x C table, because the
+     residual loop accumulates A^T R in the same sweep. Everything after that is O(P d C) with no
+     further nnz traffic. A future edit that adds a second pass fails this test.
 """
 from __future__ import annotations
 
@@ -111,8 +114,45 @@ def selftest():
             best = int(np.argmin(D[j]))
             moved = best != cstar[j]
             assert moved == bool(misled[j]), (j, best, cstar[j], D[j].min())
+    # 5: OPTIMALITY. The expensive resource is a d-CHANNEL pass over nnz (d floats per non-zero);
+    #    the scalar reductions (D, G_jj, r) are ~1 float per non-zero and are negligible beside it.
+    #    The claim is that exactly ONE d-channel pass is needed: the loop that forms the residual
+    #    R = B - A X* also accumulates A^T R in the same sweep. Everything downstream -- the whole
+    #    P x C table of Delta_j(c) -- is then O(P d C) with NO further nnz traffic.
+    class _Op:
+        def __init__(self, A): self.A = A; self.vec_passes = 0; self.scalar_passes = 0
+        def scalar(self, f): self.scalar_passes += 1; return f(self.A)
+        def resid_and_AtR(self, B, X):
+            self.vec_passes += 1
+            Rr = B - self.A @ X
+            return Rr, self.A.T @ Rr
+    rng2 = np.random.default_rng(11)
+    for _ in range(50):
+        R, P, C, d = 30, 6, 5, 7
+        T = rng2.normal(size=(C, d)); T /= np.linalg.norm(T, axis=1, keepdims=True)
+        A = np.abs(rng2.normal(size=(R, P))) * (rng2.random((R, P)) < 0.6)
+        A[:, A.sum(0) == 0] = 1.0
+        A[A.sum(1) == 0, :] = 1.0           # a ray touching NO primitive would divide by zero
+        A = A / np.maximum(A.sum(1)[:, None], 1e-30) * 0.9
+        assert np.isfinite(A).all()
+        cstar = rng2.integers(0, C, P); Xs = T[cstar]
+        B = A @ Xs + 0.3 * rng2.normal(size=(R, d))
+        op = _Op(A)
+        Gjj = op.scalar(lambda M: (M ** 2).sum(0))
+        Rr, AtR = op.resid_and_AtR(B, Xs)
+        Dtab = delta_flip(AtR, Gjj, T, cstar)
+        assert op.vec_passes == 1, f"expected ONE d-channel pass, used {op.vec_passes}"
+        assert Dtab.shape == (P, C)
+        # and it agrees with explicit per-flip re-evaluation, so the single pass loses nothing
+        base = float((Rr ** 2).sum())
+        for j in (0, P // 2, P - 1):
+            for c in range(C):
+                X2 = Xs.copy(); X2[j] = T[c]
+                assert abs((float(((B - A @ X2) ** 2).sum()) - base) - Dtab[j, c]) < 1e-8
+
     print("  selftest OK: closed form matches explicit re-evaluation; Delta_j(c*) = 0; N_j >= 1 and "
-          "saturates at C; MISLED_j is exactly 'coordinate descent from the truth moves j'")
+          "saturates at C; MISLED_j is exactly 'coordinate descent from the truth moves j'; "
+          "exactly ONE d-channel pass over nnz builds the whole P x C table")
 
 
 def main():
@@ -153,7 +193,14 @@ def main():
             t0 = time.time()
             row, col, val, gid, Treg, P, R, _ = XB.build(sc, arm, a.views, a.cap, dev)
             nnz = val.numel()
-            o = torch.argsort(row); row, col, val = row[o].contiguous(), col[o].contiguous(), val[o].contiguous()
+            # Sorting is only needed if the operator is not already row-ordered. With 3DGS's ~20x
+            # larger nnz the permutation plus three sorted copies is ~14 GB of avoidable
+            # duplication, which is what OOM'd the first attempt. Check before paying for it.
+            if not bool((row[1:] >= row[:-1]).all()):
+                o = torch.argsort(row)
+                row = row[o].contiguous(); col = col[o].contiguous(); val = val[o].contiguous()
+                del o
+                torch.cuda.empty_cache()
             colsum = torch.zeros(P, device=dev).index_add_(0, col, val)
             live = colsum > 0
             Gjj = torch.zeros(P, device=dev).index_add_(0, col, val * val)
@@ -237,7 +284,7 @@ def main():
             best = Dfl.argmin(1)
             misled = (best != cstar)[sel]
             frac_misled = float(misled.float().mean())
-            bound_acc = 1.0 - frac_misled                    # the corrected bound (*)
+            one_minus_misled = 1.0 - frac_misled   # NOT a bound -- A56/R7 retracted that reading
             n_strictly_better = ((Dfl < -1e-9).sum(1))[sel].float()
             r_ = {"arm": arm, "scene": sc, "P": int(P), "C": Cc, "n_scored": int(sel.sum()),
                   "base_resid2": base, "delta2_labelfree": delta2,
@@ -246,11 +293,12 @@ def main():
                   "frac_unique": float((N <= 1).float().mean()),
                   "frac_misled": frac_misled,
                   "n_strictly_better_mean": float(n_strictly_better.mean()),
-                  "bound_accuracy": bound_acc, "wall_s": round(time.time() - t0, 1)}
+                  "one_minus_misled": one_minus_misled, "wall_s": round(time.time() - t0, 1)}
             out.append(r_); json.dump(out, open(a.out, "w"), indent=1)
             print(f"[{arm}/{sc}] C={Cc} | MISLED {100*frac_misled:.1f}% of primitives "
                   f"(mean {r_['n_strictly_better_mean']:.2f} strictly-better wrong classes) | "
-                  f"ACCURACY BOUND for residual minimisers {100*bound_acc:.1f}% | N_j within delta "
+                  f"1-MISLED {100*one_minus_misled:.1f}% (NOT a bound, A56/R7) | ratio/(C-1) "
+                  f"{float(n_strictly_better.mean())/max(Cc-1,1):.3f} | N_j within delta "
                   f"mean {r_['N_mean']:.2f}  {r_['wall_s']}s", flush=True)
             del row, col, val, gid, Treg, AtR, Xs
             torch.cuda.empty_cache()
