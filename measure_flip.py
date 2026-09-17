@@ -48,7 +48,7 @@ from diagnose_holes import SCENES, GT_ROOT
 FOAM = {"truefrozen", "nonfrozen"}
 
 
-def load_view_features(feat_dir, stem, H, W, dev):
+def load_view_features(feat_dir, stem, H, W, dev, normalize=True):
     f = np.load(os.path.join(feat_dir, f"{stem}_f.npy")).astype(np.float32)
     s = np.load(os.path.join(feat_dir, f"{stem}_s.npy"))
     if s.ndim == 3:
@@ -57,7 +57,12 @@ def load_view_features(feat_dir, stem, H, W, dev):
         from PIL import Image
         s = np.array(Image.fromarray(s.astype(np.int32)).resize((W, H), Image.NEAREST))
     t = torch.from_numpy(np.ascontiguousarray(f)).float().to(dev)
-    t = torch.nn.functional.normalize(t, dim=-1)
+    # NOTE: region features are L2-normalised here, for EVERY caller. That is what makes
+    # ||x'_j|| <= 1 (a convex combination of unit vectors) and is load-bearing for the unit-ball
+    # bound. `normalize=False` is only for measuring what that normalisation is worth; it requires
+    # a feature dir that actually stores un-normalised vectors (openclip_features_sam_l3_nonorm).
+    if normalize:
+        t = torch.nn.functional.normalize(t, dim=-1)
     return torch.from_numpy(np.ascontiguousarray(s)).long().reshape(-1).to(dev), t
 
 

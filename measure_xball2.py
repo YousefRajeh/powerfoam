@@ -50,7 +50,8 @@ from measure_flip import load_view_features
 FOAM = {"truefrozen", "nonfrozen"}
 
 
-def build(scene, arm, views, cap, dev):
+def build(scene, arm, views, cap, dev, feat_dirname="openclip_features_sam_l3",
+          normalize_features=True):
     """Operator plus the factorised observations: seg ids per ray and the stacked region table."""
     recon = arm.replace("pf_", "")
     cfg = f"output/scannet_{scene}_{recon if recon in FOAM else 'truefrozen'}/config.yaml"
@@ -59,7 +60,7 @@ def build(scene, arm, views, cap, dev):
     args = p.parse_args(["-c", cfg])
     dh = DataHandler(args); dh.reload("all", downsample=args.downsample[-1])
     sel = np.linspace(0, len(dh.cameras) - 1, views).astype(int).tolist()
-    feat_dir = os.path.join(args.data_path, args.scene, "openclip_features_sam_l3")
+    feat_dir = os.path.join(args.data_path, args.scene, feat_dirname)
     stems = sorted(os.path.splitext(f)[0][:-2] for f in os.listdir(feat_dir) if f.endswith("_f.npy"))
 
     if recon in FOAM:
@@ -95,7 +96,8 @@ def build(scene, arm, views, cap, dev):
             ri, ci, vv, _, _ = export_view_operator(gm, gq, gs_, go, gc, vm, K.to(dev), W, H,
                                                     max_hits_per_pixel=cap,
                                                     transmittance_floor=1e-3)
-        seg, tab = load_view_features(feat_dir, stems[vi % len(stems)], H, W, dev)
+        seg, tab = load_view_features(feat_dir, stems[vi % len(stems)], H, W, dev,
+                                      normalize=normalize_features)
         rows.append(ri.to(torch.int64).to(dev) + offs)
         cols.append(ci.to(torch.int64).to(dev))
         vals.append(vv.float().to(dev))
