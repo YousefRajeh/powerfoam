@@ -70,6 +70,12 @@ def main():
     p.add_argument("--wait", action="store_true",
                    help="Block until the local GPU is free before extracting.")
     p.add_argument("--poll", type=int, default=300)
+    p.add_argument("--no-norm", action="store_true",
+                   help="store UN-normalised per-mask CLIP embeddings (LANGSPLAT_NO_NORM=1). "
+                        "The lifting forward model A x = B is linear alpha-compositing, which is "
+                        "only coherent if the observable carries magnitude; normalising every "
+                        "B_i to 1 makes ||(A x)_i|| <= 1 = ||B_i|| structurally unsatisfiable. "
+                        "Default OFF = LangSplat/OpenGaussian protocol, unchanged.")
     p.add_argument("--fill", type=int, default=0,
                    help="Pixels inside the bbox but outside the mask. 0 = LangSplat/OpenGaussian.")
     p.add_argument("--pad", type=int, default=0,
@@ -84,6 +90,11 @@ def main():
                         "3.16x faster with the kept level byte-identical. Empty = all four. "
                         "NOTE: the artifact then holds ONE level, stored at index 0, so the "
                         "lift must be run with --sam-level 0, not 3.")
+    p.add_argument("--data-root", default=DATA,
+                   help="Parent of the per-scene folders. LERF-OVS lives at "
+                        r"data\lerf_ovs_raw\lerf_ovs and has no _colmap suffix.")
+    p.add_argument("--scene-suffix", default="_colmap",
+                   help="Appended to the scene name to form its folder; empty for LERF-OVS.")
     p.add_argument("--out-name", default="openclip_features_sam_l3",
                    help="Per-scene output folder name.")
     p.add_argument("--shards", type=int, default=3,
@@ -114,6 +125,11 @@ def main():
 
     env = dict(os.environ)
     env["LANGSPLAT_FILL_VALUE"] = str(a.fill)
+    if a.no_norm:
+        env["LANGSPLAT_NO_NORM"] = "1"
+        print("[norm] storing UN-NORMALISED per-mask CLIP embeddings", flush=True)
+    else:
+        env.pop("LANGSPLAT_NO_NORM", None)
     env["LANGSPLAT_PAD_VALUE"] = str(a.pad)
     if a.only_level:
         env["SAM_ONLY_LEVEL"] = a.only_level
@@ -125,7 +141,7 @@ def main():
     todo = [x for x in (a.scenes.split(",") if a.scenes else SCENES) if x]
     print(f"[plan] {len(todo)} scene(s): {', '.join(todo)}", flush=True)
     for s in todo:
-        src = os.path.join(DATA, f"{s}_colmap")
+        src = os.path.join(a.data_root, f"{s}{a.scene_suffix}")
         done = os.path.join(src, a.out_name)
         # The extractor emits TWO files per image (`{idx}_f.npy` features, `{idx}_s.npy` seg),
         # so completeness is 2*n_images. The old `> 4` guard would have accepted a run that

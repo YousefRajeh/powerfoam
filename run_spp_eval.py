@@ -141,6 +141,17 @@ def main():
                         "the cleanest) and 22.6%% on 27dd4da69e, whose laser mesh extends beyond "
                         "the DSLR coverage. k=5/k=10 would discard 22%%/4.5%% of a good scene.")
     p.add_argument("--outdir", default="artifacts/scannetpp/eval")
+    # Overrides so the NATIVE-resolution reconstructions can be scored without shadowing the
+    # existing 1600 px artifacts (which are the baseline this is compared against).
+    p.add_argument("--ckpt-dir", default=None,
+                   help="explicit checkpoint dir; overrides RECON/spp_<recon>_<scene>")
+    # A_base uses `raw` only. The centred/mode-vote variant needs a facet adjacency graph and a
+    # stats file built for THAT geometry -- neither exists for a freshly solved reconstruction, and
+    # building them is wasted work when only the base rung is wanted.
+    p.add_argument("--base-only", action="store_true",
+                   help="score only A_base; skip the arms needing adjacency + reliability")
+    p.add_argument("--solved", default=None,
+                   help="explicit solved features .pt; overrides <art>/solved_geometric_median_nonfrozen_ogl3.pt")
     a = p.parse_args()
 
     enable_determinism()
@@ -156,10 +167,17 @@ def main():
             print(f"[skip] {scene}", flush=True); continue
         t0 = time.time()
         art = f"artifacts/scannetpp/{scene}"
-        ck = os.path.join(RECON, f"spp_{a.recon}_{scene}")
+        ck = (a.ckpt_dir.replace("{scene}", scene) if a.ckpt_dir
+              else os.path.join(RECON, f"spp_{a.recon}_{scene}"))
         centers, radii = load_points_radii(ck)
-        sv = torch.load(f"{art}/solved_geometric_median_nonfrozen_ogl3.pt",
-                        map_location=device, weights_only=True)
+        sv_path = (a.solved.replace("{scene}", scene) if a.solved
+                   else f"{art}/solved_geometric_median_nonfrozen_ogl3.pt")
+        sv = torch.load(sv_path, map_location=device, weights_only=True)
+        # A solve built on different geometry would score silently and wrongly; the row count is
+        # the one cheap invariant that ties them together.
+        if sv["primitive_features"].shape[0] != centers.shape[0]:
+            raise SystemExit("%s: solved has %d rows but checkpoint has %d primitives -- mismatched pair"
+                             % (scene, sv["primitive_features"].shape[0], centers.shape[0]))
         feats = sv["primitive_features"].to(device).float()
         valid_mask = sv["valid_mask"].cpu().numpy()
         vm = torch.from_numpy(valid_mask).to(device)
@@ -181,21 +199,25 @@ def main():
         # ---- the two feature-space variants -------------------------------------------
         mu = F.normalize(raw[vm].mean(0, keepdim=True), dim=-1)
         cen = raw.clone(); cen[vm] = F.normalize(raw[vm] - LAM * mu, dim=-1)
-        adj = torch.load(f"{art}/adjacency_true_facet.pt", map_location=device, weights_only=True)
-        ad0 = adj["adjacent"].to(device).long(); of0 = adj["offsets"].to(device).long()
-        Rr = AccumulatedFeatureStats.load(f"{art}/stats_nonfrozen_ogl3.pt"
-                                          ).reliability()["reliability"].to(device).float() * vm
-        Dm = int((of0[1:] - of0[:-1]).max()) + 1
-        from run_normlift_refine_eval import mode_vote_refine
-        positions = torch.from_numpy(centers).to(device).float()
-        cen = mode_vote_refine(cen, Rr, positions, ad0, of0,
-                               chunk=max(256, 200_000 // max(Dm, 1)))
-        del Rr
-        src, dst, _ = csr_to_edges(ad0, of0, P, device)
-        keep = vm[src] & vm[dst]; src, dst = src[keep], dst[keep]
-        deg = torch.zeros(P, dtype=torch.long, device=device).index_add_(
-            0, src, torch.ones_like(src))
-        del adj, ad0, of0
+        if a.base_only:
+            cen = None
+            deg = torch.zeros(P, dtype=torch.long, device=device)
+        else:
+         adj = torch.load(f"{art}/adjacency_true_facet.pt", map_location=device, weights_only=True)
+         ad0 = adj["adjacent"].to(device).long(); of0 = adj["offsets"].to(device).long()
+         Rr = AccumulatedFeatureStats.load(f"{art}/stats_nonfrozen_ogl3.pt"
+                                           ).reliability()["reliability"].to(device).float() * vm
+         Dm = int((of0[1:] - of0[:-1]).max()) + 1
+         from run_normlift_refine_eval import mode_vote_refine
+         positions = torch.from_numpy(centers).to(device).float()
+         cen = mode_vote_refine(cen, Rr, positions, ad0, of0,
+                                chunk=max(256, 200_000 // max(Dm, 1)))
+         del Rr
+         src, dst, _ = csr_to_edges(ad0, of0, P, device)
+         keep = vm[src] & vm[dst]; src, dst = src[keep], dst[keep]
+         deg = torch.zeros(P, dtype=torch.long, device=device).index_add_(
+             0, src, torch.ones_like(src))
+         del adj, ad0, of0
         torch.cuda.empty_cache()
 
         res = {"scene": scene, "recon": a.recon, "arms": {}}
@@ -236,6 +258,12 @@ def main():
             del cr
 
             # FROZEN STACK: centre -> prerefine -> CSLS -> rank-encode -> diffuse -> argmax
+            # Skipped under --base-only: `cen` is None there because the adjacency graph and
+            # reliability stats this arm needs are not built for a freshly solved reconstruction.
+            if a.base_only:
+                del text
+                torch.cuda.empty_cache()
+                continue
             cc = torch.zeros(P, C, device=device); cc[vm] = cen[vm] @ text.T
             kk = min(CSLS_K, int(vm.sum()))
             cc[vm] = cc[vm] - 0.5 * cc[vm].topk(kk, dim=0).values.mean(0)[None, :]
@@ -248,7 +276,12 @@ def main():
         with open(out, "w") as fh:
             json.dump(res, fh, indent=2)
         print(f"[{scene}] done {time.time()-t0:.0f}s", flush=True)
-        del raw, cen, src, dst, deg
+        # src/dst/deg exist only when the adjacency arms ran; under --base-only they were
+        # never bound, and an unconditional del raises after a perfectly good score.
+        for _v in ("raw", "cen", "src", "dst", "deg"):
+            if _v in dir():
+                del _v
+        raw = cen = None
         torch.cuda.empty_cache()
 
 

@@ -54,8 +54,8 @@ def main():
     ap.add_argument("--solvers", default="geometric_median,weighted")
     ap.add_argument("--tikhonov", type=float, default=None,
                     help="Splat Feature Solver's Tikhonov Guidance (paper optimum 1.2): squeezes "
-                         "opacity as sigmoid(theta*lambda), Eq.23. The SQUARED-weight half of "
-                         "Eq.24 is already unconditional in their CUDA kernel. Artifacts are "
+                         "opacity as sigmoid(theta*lambda), Eq.17. The SQUARED-weight half of "
+                         "Eq.18 is already unconditional in their CUDA kernel. Artifacts are "
                          "written under a separate _tikh tag so the two lifts never collide.")
     a = ap.parse_args()
     scenes = [s for s in a.scenes.split(",") if s] or SPP

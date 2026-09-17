@@ -82,13 +82,24 @@ FEATURES = {
     "pf_tfroz":   "artifacts/scannet/{s}/solved_geometric_median_truefrozen_ogl3.pt",
     "gs_froz":    "artifacts/scannet/{s}/solved_weighted_gs_froz_ogl3.pt",
     "gs_unfroz":  "artifacts/scannet/{s}/solved_weighted_gs_unfroz_ogl3.pt",
+    # SOLVER-MATCHED 3DGS arms (run_scannet_gs_reaccumulate.py). The four rows above compare the
+    # foam's geometric-median solve against a 3DGS WEIGHTED solve, so they measure pipeline, not
+    # representation. These two are the same checkpoints re-solved with the foam's own solver; they
+    # are separate recon tags so nothing already in the DB is overwritten or silently changed.
+    "gs_froz_gm":   "artifacts/scannet/{s}/solved_geometric_median_gs_froz_ogl3.pt",
+    "gs_unfroz_gm": "artifacts/scannet/{s}/solved_geometric_median_gs_unfroz_ogl3.pt",
 }
+# recon tag -> the arm whose cached point->primitive assignment applies. The _gm arms are the SAME
+# checkpoints as their base arms, so they must reuse that assignment rather than build a second one.
+ASSIGN_ARM = {"gs_froz_gm": "gs_froz", "gs_unfroz_gm": "gs_unfroz"}
 # verbatim from ablation_assign.py
 CKPT = {
     "pf_tfroz":   ("foam", "output/scannet_{s}_truefrozen/model.pt"),
     "pf_nonfroz": ("foam", "output/scannet_{s}_nonfrozen/model.pt"),
     "gs_froz":    ("gs",   "recon_remote/gs_froz/{s}/ckpt.pt"),
     "gs_unfroz":  ("gs",   "recon_remote/gs_unfroz/{s}/ckpt.pt"),
+    "gs_froz_gm":   ("gs", "recon_remote/gs_froz/{s}/ckpt.pt"),
+    "gs_unfroz_gm": ("gs", "recon_remote/gs_unfroz/{s}/ckpt.pt"),
 }
 
 
@@ -139,7 +150,8 @@ def main():
         for recon in a.recons.split(","):
             for scene in [s for s in a.scenes.split(",") if s in SPLIT]:
                 fp = FEATURES[recon].format(s=scene)
-                apth = f"artifacts/ablation_cache/{scene}_{recon}_assign.npy"
+                apth = (f"artifacts/ablation_cache/{scene}_"
+                        f"{ASSIGN_ARM.get(recon, recon)}_assign.npy")
                 if not all(os.path.exists(p) for p in (fp, apth)):
                     skipped.append(f"{recon}/{scene}: missing feature or assignment")
                     continue
@@ -216,7 +228,12 @@ def main():
                             "mae_gt2pred,hd95,boundary_f1,n_missed,assignment,masked,source,"
                             "created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
                             (scene, recon, "ogl3",
-                             "geometric_median" if recon.startswith("pf") else "weighted",
+                             # The _gm arms ARE geometric-median solves (run_scannet_gs_reaccumulate.py).
+                             # Deriving this from the recon prefix alone would stamp them "weighted"
+                             # -- the same hardcoded-solver-column error that made
+                             # backfill_surface_cross_recon.py's rows unreadable.
+                             "geometric_median" if (recon.startswith("pf")
+                                                    or recon.endswith("_gm")) else "weighted",
                              # the surface reference goes IN THE METHOD NAME. Without it the
                              # mesh-scored row collides with the vertex-scored row on the UNIQUE
                              # key and INSERT OR IGNORE silently keeps the OLD numbers -- the

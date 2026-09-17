@@ -126,11 +126,23 @@ def classify_primitives(primitive_features, text_feats, hubness_correct=False):
 
     Pass hubness_correct=True explicitly for ablation rows; never for a headline number.
     """
+    # A PRIMITIVE WITH NO FEATURE MUST NOT GET A FREE PREDICTION. F.normalize of an all-zero row
+    # returns zeros, whose cosine is identically 0 against every class, so argmax silently returns
+    # index 0 -- i.e. the FIRST class in the query bank, which for the OpenGaussian sets is "wall",
+    # the most common class in ScanNet. Those points are then frequently correct by accident, which
+    # inflates the score instead of merely adding noise. Measured shares of zero-norm features:
+    # SFS 20.2%, NormLift 20.2%, LUDVIG 17.1%; OpenGaussian reaches 41.8% through its own
+    # `leaf_lang_feat[occu_count < 2] *= 0` rule. Returning -1 makes such rows UNPREDICTED: every
+    # call site adds 1 to land in the 1..K label space, so -1 becomes 0, which calculate_metrics
+    # already treats as "no prediction" and scores as a miss.
+    zero = primitive_features.norm(dim=-1) == 0
     unit_features = F.normalize(primitive_features, dim=-1)
     sim = unit_features @ text_feats.T  # (P, K)
     if hubness_correct:
         sim = (sim - sim.mean(dim=0, keepdim=True)) / sim.std(dim=0, keepdim=True).clamp_min(1e-6)
-    return sim.argmax(dim=-1)
+    out = sim.argmax(dim=-1)
+    out[zero] = -1
+    return out
 
 
 def apply_gt_opacity_mask(gt_labels_remapped, assigned, primitive_alpha, threshold, tag):

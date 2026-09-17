@@ -7,7 +7,7 @@ SFS (arXiv:2508.12216) proves its back-projection estimator x' is near-optimal:
                 mu_i     = sum_j A_ij Delta_ij
                 sigma_i^2= sum_j A_ij (Delta_ij^2 - mu_i^2)
                 beta     = max_i beta_i,  beta_i = sigma_i^2 / mu_i^2
-    Eq. 7    x_j = sum_i A_ij B_i / sum_i A_ij        (denominator is the SUM OF WEIGHTS)
+    Eq. 6    x_j = sum_i A_ij B_i / sum_i A_ij        (denominator is the SUM OF WEIGHTS)
 
 beta_i is the weighted variance of ||x_hat_j - B_i|| over the primitives ON RAY i, normalised by
 its mean. It is zero exactly when every primitive sharing a ray sits at the same distance from
@@ -26,7 +26,7 @@ Delta_ij needs x_hat, the true minimiser of ||A f - b||^2. We have it: the uncon
 solve is exactly that (converged to relative residual 9.6e-05). So this measurement is only
 possible BECAUSE of the solver infrastructure, even though that solver lost.
 
-Note Eq. 7's denominator is sum_i A_ij, the sum of weights -- NOT sum_i A_ij^2. This confirms from
+Note Eq. 6's denominator is sum_i A_ij, the sum of weights -- NOT sum_i A_ij^2. This confirms from
 the primary source that describing back-projection as "the diagonal of the normal equations" was
 wrong; it is a weighted average, hence a convex combination, hence inside the hull of observed
 embeddings for free.

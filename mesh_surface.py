@@ -46,10 +46,19 @@ import numpy as np
 import open3d as o3d
 from scipy.spatial import cKDTree
 
-MESH_ROOT = r"D:\Downloads\scenes10_points3d"
+# Overridable so a collaborator can point at their own copy without editing source.
+MESH_ROOT = os.environ.get("PF_MESH_ROOT", r"D:\Downloads\scenes10_points3d")
 TAU = 0.02              # 2 cm boundary criterion, same as ablation_surface
 GT_SAMPLES_PER_M2 = 2500        # ~2 cm spacing; ScanNet's own vertices are ~1360 /m^2
 MIN_SAMPLES_PER_CLASS = 500
+
+# Distance charged to a class the method never predicted. A missed class cannot be scored, and
+# dropping it from the per-class mean would make silence cheaper than a wrong answer. 1 m is far
+# outside any plausible correct distance (tau = 2 cm; the strongest methods sit near 0.43 m SCD)
+# yet small enough that one omitted class does not dominate a ~14-class average, unlike the
+# scene diagonal (7-10 m) used previously.
+MISSED_CAP = 1.0
+
 
 
 def load_mesh(scene: str):
@@ -118,6 +127,8 @@ class MeshSurfaceIndex:
         self.trees = {}         # class -> KD-tree over those samples
         self.area = {}
 
+        # scene diagonal, used to charge classes the prediction never covered
+        self.bbox_diag = float(np.linalg.norm(V.max(axis=0) - V.min(axis=0)))
         fl = face_labels(Tri, vert_labels)
         for c in range(1, n_classes):
             sel = fl == c
@@ -151,7 +162,8 @@ class MeshSurfaceIndex:
 
 
 def semantic_surface_metrics_mesh(index: MeshSurfaceIndex, pred_pts: np.ndarray,
-                                  pred_cls: np.ndarray, tau: float = TAU):
+                                  pred_cls: np.ndarray, tau: float = TAU,
+                                  missed_penalty: bool = True, missed_cap=None):
     """Same metric definitions as ablation_surface, with the mesh as the reference.
 
     `pred_pts` (N,3) predicted surface points, `pred_cls` (N,) their 1-based class ids.
@@ -182,13 +194,23 @@ def semantic_surface_metrics_mesh(index: MeshSurfaceIndex, pred_pts: np.ndarray,
             "boundary_precision": prec, "boundary_recall": rec,
             "boundary_f1": float(2 * prec * rec / max(prec + rec, 1e-9)),
         }
-    live = [m for m in per_class.values() if not m["missed"]]
     n_missed = sum(1 for m in per_class.values() if m["missed"])
+    keys = ("mae_pred2gt", "mae_gt2pred", "scd", "hd95",
+            "boundary_precision", "boundary_recall", "boundary_f1")
+    if missed_penalty and n_missed:
+        d_max = MISSED_CAP if missed_cap is None else float(missed_cap)
+        for m in per_class.values():
+            if m["missed"]:
+                m.update({"mae_pred2gt": d_max, "mae_gt2pred": d_max,
+                          "scd": d_max, "hd95": d_max,
+                          "boundary_precision": 0.0, "boundary_recall": 0.0,
+                          "boundary_f1": 0.0, "penalised": True, "d_max": d_max})
+        live = list(per_class.values())
+    else:
+        live = [m for m in per_class.values() if not m["missed"]]
     if not live:
         return {"n_classes_present": len(per_class), "n_missed": n_missed, "n_scored": 0}
-    agg = {k: float(np.mean([m[k] for m in live]))
-           for k in ("mae_pred2gt", "mae_gt2pred", "scd", "hd95",
-                     "boundary_precision", "boundary_recall", "boundary_f1")}
+    agg = {k: float(np.mean([m[k] for m in live])) for k in keys}
     agg.update({"n_classes_present": len(per_class), "n_missed": n_missed,
                 "n_scored": len(live), "tau": tau, "per_class": per_class})
     return agg

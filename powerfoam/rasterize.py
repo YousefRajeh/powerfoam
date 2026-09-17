@@ -964,9 +964,30 @@ class Rasterizer:
             if pix_i >= camera.height or pix_j >= camera.width:
                 return
 
-            ray_d = get_ray_dir(camera, float(pix_i), float(pix_j))
-            ray_d = ray_d / wp.length(ray_d)
-            ray_o = camera.eye
+            # MIRROR forward_kernel's branch. `get_ray_dir` rebuilds the ray from the right/up
+            # basis, which assumes the principal point sits at the image centre; `ray_maps` carries
+            # the dataset's exact intrinsics. They agree only when cx, cy == W/2, H/2 (see
+            # camera.py::_build_ray_maps_from_basis). Using the basis form unconditionally, as this
+            # kernel previously did, silently exported an operator for a DIFFERENT camera than the
+            # renderer uses whenever is_pinhole is false. On ScanNet (is_pinhole=True, principal
+            # point off-centre by 0.25 px) the two differ by <=0.5 px, but the exported A must be
+            # the renderer's own, so the branch is reproduced exactly rather than assumed harmless.
+            if is_pinhole:
+                ray_d = get_ray_dir(camera, float(pix_i), float(pix_j))
+                ray_d = ray_d / wp.length(ray_d)
+                ray_o = camera.eye
+            else:
+                ray_o = wp.vec3f(
+                    camera.ray_maps[pix_i, pix_j, 0],
+                    camera.ray_maps[pix_i, pix_j, 1],
+                    camera.ray_maps[pix_i, pix_j, 2],
+                )
+                ray_d = wp.vec3f(
+                    camera.ray_maps[pix_i, pix_j, 3],
+                    camera.ray_maps[pix_i, pix_j, 4],
+                    camera.ray_maps[pix_i, pix_j, 5],
+                )
+                ray_d = ray_d / wp.length(ray_d)
             row_idx = pix_i * camera.width + pix_j
 
             log_t = float(0.0)

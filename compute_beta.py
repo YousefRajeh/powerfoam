@@ -74,6 +74,59 @@ def load_view_features(feat_dir, stem, H, W):
     return seg.reshape(-1), t
 
 
+def _flip_stats(x_prime, x_hat, prim_gap, colsum, scene, dev):
+    """Does the feature-space excess predict an ARGMAX FLIP?
+
+    The suboptimality bound `L(X') - L(Xhat) <= E_H(Xhat)` is exact in feature space, but mIoU only
+    moves when the READOUT changes -- a large feature error that leaves argmax alone is free, a tiny
+    one that crosses a decision boundary costs a point. Every feature-space quantity we tried
+    (E_H, gamma, gap/rays, mean_o) predicts the mIoU solve gap at r ~ +0.27, i.e. not at all.
+
+    So test the missing link directly, PER PRIMITIVE (n ~ 3e4, not n = 10 scenes): does a
+    primitive's own share of the gap predict whether its label flips between X' and Xhat?
+
+      * if YES  -- the bound is sound and the readout is simply the lossy step, and a flip-rate
+                   bound is the thing to state;
+      * if NO   -- feature-space excess is unrelated to the decision even per primitive, and no
+                   bound of this family can govern the metric.
+
+    AUC is used rather than a correlation because `flip` is binary and `prim_gap` is heavy-tailed;
+    it answers "is a flipped primitive's gap bigger than a non-flipped one's?" with no distributional
+    assumption. AUC 0.5 = no information.
+    """
+    import glob, os
+    from evaluate_point_cloud_miou import OPENGAUSSIAN_CLASS_SETS, embed_class_names, remap_gt_labels
+    from diagnose_scannet_miou import load_scannet_pointcept_gt
+    from diagnose_holes import GT_ROOT
+    try:
+        d = [q for q in glob.glob(os.path.join(GT_ROOT, "*", scene)) if os.path.isdir(q)][0]
+        _, raw, names = load_scannet_pointcept_gt(d, "segment20")
+        n2i = {n: i for i, n in enumerate(names)}
+        pres = set(np.unique(raw).tolist())
+        kept = [n for n in OPENGAUSSIAN_CLASS_SETS["opengaussian19"] if n2i[n] in pres]
+        T = embed_class_names(kept, dev)
+        T = T / T.norm(dim=-1, keepdim=True)
+    except Exception as e:
+        return {"flip_error": f"{type(e).__name__}: {e}"}
+    live = colsum > 0
+    if not bool(live.any()):
+        return {}
+    xp = x_prime[live] / x_prime[live].norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    xh = x_hat[live] / x_hat[live].norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    lp = (xp @ T.T).argmax(1)
+    lh = (xh @ T.T).argmax(1)
+    flip = (lp != lh)
+    g = prim_gap[live]
+    nf, nn = int(flip.sum()), int((~flip).sum())
+    if nf == 0 or nn == 0:
+        return {"flip_frac": float(flip.float().mean()), "flip_auc": float("nan"), "flip_n": nf}
+    # AUC via the rank-sum identity, exact and O(n log n)
+    r = torch.argsort(torch.argsort(g.double())).double() + 1.0
+    auc = float((r[flip].sum() - nf * (nf + 1) / 2) / (nf * nn))
+    return {"flip_frac": float(flip.float().mean()), "flip_auc": auc, "flip_n": nf,
+            "flip_gap_ratio": float(g[flip].mean() / g[~flip].mean().clamp_min(1e-30))}
+
+
 def cg_normal_equations(matmul, rmatmul, rhs, diag, iters=300, rtol=1e-6):
     """Jacobi-preconditioned CG on (A^T A) x = rhs, block over feature channels.
 
@@ -115,6 +168,18 @@ def main():
     ap.add_argument("--views", type=int, default=12)
     ap.add_argument("--cap", type=int, default=512)
     ap.add_argument("--cg-iters", type=int, default=300)
+    ap.add_argument("--ridge", default="1e-6",
+                    help="ridge values as multiples of mean(diag G); 0 = unregularised. Each value "
+                         "costs a FULL CG solve and only --beta-at is reported, so the default is "
+                         "now the single reported value. The sensitivity question this sweep "
+                         "answered is settled (05_open_questions A23: beta_p50 moves 0.58%% from "
+                         "lam=0 to 1e-6 while beta_max moves 96%%); pass the old "
+                         "'0,1e-8,1e-6,1e-4,1e-2' to reproduce it.")
+    ap.add_argument("--no-region-space", action="store_true",
+                    help="solve in the full D=512 feature space instead of the exact M-channel "
+                         "region subspace; for cross-checking the reduction")
+    ap.add_argument("--beta-at", default="1e-6",
+                    help="which ridge value the headline beta is reported at")
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
     dev = "cuda"
@@ -208,11 +273,35 @@ def main():
         return out
 
     # ---- rhs = A^T B, streamed over nonzero chunks ----
-    rhs = torch.zeros((P, D), device=dev)
+    # REGION SPACE. B is not an arbitrary (R, D) matrix: every row is a lookup into that view's
+    # per-SAM-region table, so B = S T exactly, with S one-hot (R, M) and T (M, D) the stacked
+    # tables. M is the number of regions over the selected views -- 247 on scene0070, 162 on
+    # scene0000 -- against D = 512. Since CG is linear in the right-hand side, solving
+    #     (G + lam I) Y = A^T S        then      x_hat = Y T
+    # gives the identical minimiser while every gather inside AtA carries M columns instead of D.
+    # This is exact, not an approximation. Disable with --no-region-space to cross-check.
     CH = 4_000_000
-    for s in range(0, nnz, CH):
-        e = min(s + CH, nnz)
-        rhs.index_add_(0, col[s:e], val[s:e, None] * B_rows(row[s:e]))
+    T_all = torch.cat(tables, 0)                       # (M, D), each row already L2-normalised
+    M = T_all.shape[0]
+    gid = torch.cat([seg.clamp(0, tab.shape[0] - 1) + off for seg, tab, off in
+                     zip(seg_all, tables,
+                         torch.tensor([0] + [t.shape[0] for t in tables[:-1]],
+                                      device=dev).cumsum(0).tolist())])
+    use_region = (not a.no_region_space) and M < D
+    if use_region:
+        rhs_s = torch.zeros((P, M), device=dev)
+        for s in range(0, nnz, CH):
+            e = min(s + CH, nnz)
+            rhs_s.index_put_((col[s:e], gid[row[s:e]]), val[s:e], accumulate=True)
+        rhs = rhs_s @ T_all                            # A^T B, for x_prime and reporting
+        print(f"  region space: solving {M} channels instead of D={D} "
+              f"({D / max(M, 1):.1f}x less gather per CG iteration)", flush=True)
+    else:
+        rhs_s = None
+        rhs = torch.zeros((P, D), device=dev)
+        for s in range(0, nnz, CH):
+            e = min(s + CH, nnz)
+            rhs.index_add_(0, col[s:e], val[s:e, None] * B_rows(row[s:e]))
     diag = torch.zeros(P, device=dev).index_add_(0, col, val * val)
 
     # FUSED A^T A, BLOCKED OVER ROWS. Computing A^T(A p) as two separate passes materialises the
@@ -254,9 +343,91 @@ def main():
             del ap
         return o
 
-    x_hat, info = cg_normal_equations(lambda p: p, AtA, rhs, diag, iters=a.cg_iters)
+    # RIDGE SWEEP. beta is NOT a property of the data when G = A^T A is rank-deficient: it reads
+    # Xhat itself (through Delta_ij = ||xhat_j - b_i||), not A Xhat, so two exact minimisers with
+    # identical loss give different beta. test_beta_math.py constructs that case explicitly -- beta
+    # moves 9x along a null direction at constant loss, while the excess L(X') - L(Xhat) is
+    # invariant to 1e-9. On these scenes Xhat runs to ||xhat_j|| ~ 1e7 in near-null directions, so
+    # an unregularised beta_max is reporting the solver's arbitrary choice among minimisers.
+    #
+    # Solving (G + lam I) x = A^T B for a sweep of lam makes the choice explicit: lam -> 0 is the
+    # minimum-norm minimiser, and the sweep shows directly whether beta diverges as the
+    # regularisation is removed. gamma is reported alongside because it must NOT move.
+    lam_scale = float(diag.mean())
+    lams = [float(x) * lam_scale for x in a.ridge.split(",")]
+    sweep = []
+    x_hat = None
+    for lam in lams:
+        def AtA_l(x, lam=lam):
+            return AtA(x) + lam * x
+        # Solve against A^T S when in region space, then map back: x = Y T. The operator
+        # (G + lam I) is untouched, so this is the same linear system with fewer right-hand
+        # sides -- the minimiser is identical, only the channel count changes.
+        b_rhs = rhs_s if use_region else rhs
+        yl, info_l = cg_normal_equations(lambda p: p, AtA_l, b_rhs, diag + lam, iters=a.cg_iters)
+        xl = (yl @ T_all) if use_region else yl
+        del yl
+        sweep.append((lam, xl, info_l))
+    # the arm reported as "the" beta uses the LAST (largest) lambda unless --beta-at is given
+    pick = min(range(len(lams)), key=lambda i: abs(lams[i] - float(a.beta_at) * lam_scale))
+    x_hat, info = sweep[pick][1], sweep[pick][2]
+    print(f"  ridge sweep over lam/mean(diag G) = {a.ridge};  beta reported at "
+          f"{a.beta_at} (lam={lams[pick]:.3e})", flush=True)
     print(f"  CG: {info['iterations']} iters, final relative residual "
           f"{info['final_rel_residual']:.3e}", flush=True)
+
+    # ---- gamma: the EXACT suboptimality of the closed form, not a bound ----------------------
+    # Because x_hat solves the normal equations, A^T(A x_hat - B) = 0, so for ANY x the cross term
+    # vanishes and Pythagoras is exact:
+    #       ||Ax - B||^2 = ||A(x - x_hat)||^2 + ||A x_hat - B||^2
+    # Hence with  gamma = ||A(x' - x_hat)||^2 / L(x_hat):     L(x') = (1 + gamma) L(x_hat) EXACTLY.
+    # beta upper-bounds gamma. Reporting both shows how much of the bound is real: beta is a max
+    # over ~1e7 rays and is set by a single pixel, while gamma is what the closed form actually
+    # gives up. gamma is nearly free here -- x_hat is already solved (the expensive part) and
+    # x' = A^T B / colsum reuses rhs.
+    #
+    # NOTE ON VALIDITY: the identity needs x_hat AT the optimum. Where CG stops on its iteration cap
+    # (the 3DGS arm) the cross term is not exactly zero, so gamma is biased -- and biased against
+    # whichever arm converges worse. cg_residual is recorded beside gamma so this is checkable.
+    # ---- overlap mass, the operator-only measurable that replaces beta -----------------------
+    # o_i = (sum_j A_ij)^2 - sum_j A_ij^2, zero exactly when a ray lands on one primitive. Unlike
+    # beta it needs no solve, no residuals and no ground truth: two accumulators over the weights
+    # the rasteriser already produces. Computed here so that beta, gamma and o are all measured on
+    # the SAME subproblem (same views, same A), which is the only way the comparison is fair.
+    row_s = torch.zeros(R, device=dev).index_add_(0, row, val)
+    row_sq = torch.zeros(R, device=dev).index_add_(0, row, val * val)
+    o_ray = (row_s * row_s - row_sq).clamp_min(0)
+    sum_o = float(o_ray.sum())
+    mean_o = sum_o / float(row_s.sum().clamp_min(1e-30))
+    o_q = [float(torch.quantile(o_ray.float(), q)) for q in (0.5, 0.9, 0.99)]
+    print(f"  sum_i o_i = {sum_o:.4e}   mean o per unit ray mass = {mean_o:.4f}   "
+          f"o p50/p90/p99 = {o_q[0]:.3f}/{o_q[1]:.3f}/{o_q[2]:.3f}", flush=True)
+
+    colsum = torch.zeros(P, device=dev).index_add_(0, col, val)
+    x_prime = rhs / colsum.clamp_min(torch.finfo(rhs.dtype).eps)[:, None]
+    d = x_prime - x_hat
+
+    gap = torch.zeros((), device=dev)          # ||A(x' - x_hat)||_F^2
+    loss_hat = torch.zeros((), device=dev)     # ||A x_hat - B||_F^2
+    prim_gap = torch.zeros(P, device=dev)      # per-primitive share of the gap
+    for r0, r1 in blocks:
+        s, e = int(starts[r0]), int(starts[r1])
+        if e <= s:
+            continue
+        lr = row[s:e] - r0
+        ad = torch.zeros((r1 - r0, D), device=dev)
+        ad.index_add_(0, lr, val[s:e, None] * d[col[s:e]])
+        gap += (ad * ad).sum()
+        ax = torch.zeros((r1 - r0, D), device=dev)
+        ax.index_add_(0, lr, val[s:e, None] * x_hat[col[s:e]])
+        resid = ax - B_rows(torch.arange(r0, r1, device=dev))
+        loss_hat += (resid * resid).sum()
+        # Attribute the gap: primitive j's own displacement weighted by how much ray mass it carries.
+        prim_gap.index_add_(0, col[s:e], (val[s:e, None] * d[col[s:e]]).pow(2).sum(-1))
+        del ad, ax, resid
+    gamma = float(gap / loss_hat.clamp_min(torch.finfo(gap.dtype).eps))
+    print(f"  gamma (exact L(x')/L(x_hat) - 1) = {gamma:.6f}    "
+          f"L(x_hat)={float(loss_hat):.4e}", flush=True)
 
     # ---- beta, TWO-PASS. Pass 1 accumulates mu_i; pass 2 accumulates the centred second
     # moment sum_j w_j (Delta_ij - mu_i)^2 directly.
@@ -269,12 +440,65 @@ def main():
     # Two-pass gives 4.9e-15 on the same inputs, because the normalised weight of a lone contributor
     # is v/v = 1 EXACTLY in IEEE754 (test_beta_variance.py). This is a stability fix, not a
     # loosened threshold.
+    rs_pre = rowsum.clamp_min(torch.finfo(rowsum.dtype).eps)
+
+    def beta_of(xh):
+        """beta_i at a GIVEN minimiser. Factored out so the ridge sweep can evaluate it at each."""
+        mu = torch.zeros(R, device=dev)
+        for s in range(0, nnz, CH):
+            e = min(s + CH, nnz)
+            d = (xh[col[s:e]] - B_rows(row[s:e])).norm(dim=-1)
+            mu.index_add_(0, row[s:e], val[s:e] * d)
+        mu = mu / rs_pre
+        m2 = torch.zeros(R, device=dev)      # holds the CENTRED moment after this loop
+        for s in range(0, nnz, CH):
+            e = min(s + CH, nnz)
+            d = (xh[col[s:e]] - B_rows(row[s:e])).norm(dim=-1)
+            w = val[s:e] / rs_pre[row[s:e]]
+            m2.index_add_(0, row[s:e], w * (d - mu[row[s:e]]) ** 2)
+        okl = live & (mu > 1e-6)
+        bl = torch.zeros(R, device=dev)
+        bl[okl] = m2[okl].clamp_min(0) / (mu[okl] ** 2)
+        return bl, okl, int((live & ~okl).sum())
+
+    # gamma must be INVARIANT across the sweep (it depends on Xhat only through A Xhat); beta is
+    # the quantity under test. Printing both side by side is the whole point.
+    print(f"  {'lam/mean(diagG)':>16}{'||xhat||max':>14}{'beta_max':>14}{'beta_p50':>12}"
+          f"{'gamma':>12}{'cg res':>10}", flush=True)
+    ridge_rows = []
+    for (lam, xl, info_l), lam_rel in zip(sweep, [float(x) for x in a.ridge.split(",")]):
+        bl, okl, _ = beta_of(xl)
+        bb = bl[okl]
+        gl = torch.zeros((), device=dev)
+        ll = torch.zeros((), device=dev)
+        dl = (rhs / colsum.clamp_min(torch.finfo(rhs.dtype).eps)[:, None]) - xl
+        for r0, r1 in blocks:
+            s0, e0 = int(starts[r0]), int(starts[r1])
+            if e0 <= s0:
+                continue
+            lr = row[s0:e0] - r0
+            adl = torch.zeros((r1 - r0, D), device=dev)
+            adl.index_add_(0, lr, val[s0:e0, None] * dl[col[s0:e0]])
+            gl += (adl * adl).sum()
+            axl = torch.zeros((r1 - r0, D), device=dev)
+            axl.index_add_(0, lr, val[s0:e0, None] * xl[col[s0:e0]])
+            rsd = axl - B_rows(torch.arange(r0, r1, device=dev))
+            ll += (rsd * rsd).sum()
+            del adl, axl, rsd
+        gam_l = float(gl / ll.clamp_min(torch.finfo(gl.dtype).eps))
+        ridge_rows.append({"lam_rel": lam_rel, "lam": lam,
+                           "xhat_norm_max": float(xl.norm(dim=-1).max()),
+                           "beta_max": float(bb.max()), "beta_p50": float(bb.median()),
+                           "gamma": gam_l, "cg_residual": info_l["final_rel_residual"]})
+        print(f"  {lam_rel:>16.0e}{ridge_rows[-1]['xhat_norm_max']:>14.3e}"
+              f"{ridge_rows[-1]['beta_max']:>14.4e}{ridge_rows[-1]['beta_p50']:>12.4e}"
+              f"{gam_l:>12.6f}{info_l['final_rel_residual']:>10.1e}", flush=True)
+
     mu = torch.zeros(R, device=dev)
     for s in range(0, nnz, CH):
         e = min(s + CH, nnz)
         d = (x_hat[col[s:e]] - B_rows(row[s:e])).norm(dim=-1)
         mu.index_add_(0, row[s:e], val[s:e] * d)
-    rs_pre = rowsum.clamp_min(torch.finfo(mu.dtype).eps)
     mu = mu / rs_pre
     m2 = torch.zeros(R, device=dev)          # holds the CENTRED moment after this loop
     for s in range(0, nnz, CH):
@@ -305,7 +529,24 @@ def main():
            "beta_p99": float(qs[2]), "beta_p999": float(qs[3]),
            "frac_beta_zero": float((b <= 1e-12).float().mean()),
            "n_degenerate_mu0": n_degen,
-           "frac_k1": float((k[ok] == 1).float().mean())}
+           "frac_k1": float((k[ok] == 1).float().mean()),
+           "ridge_sweep": ridge_rows, "beta_at": a.beta_at,
+           # The operator-only measurable, on this same subproblem.
+           "sum_o": sum_o, "mean_o": mean_o,
+           "o_p50": o_q[0], "o_p90": o_q[1], "o_p99": o_q[2],
+           # 2*sum_o bounds L(x') - L(x_c) against the UNIT-BALL optimum (Omega <= 2 there), so
+           # this ratio is the honest tightness of the replacement bound on real data.
+           "bound_ball_over_gap": 2.0 * sum_o / max(float(gap), 1e-30),
+           # gamma is the REALIZED suboptimality, exact rather than bounded; beta >= gamma always.
+           "gamma": gamma,
+           "loss_x_hat": float(loss_hat),
+           "gap_A_dx_sq": float(gap),
+           "beta_over_gamma": float(qs[0]) / max(gamma, 1e-12),
+           # Primitives whose closed-form value is furthest from optimal, for the per-cell study.
+           **_flip_stats(x_prime, x_hat, prim_gap, colsum, a.scene, dev),
+           "prim_gap_p50": float(torch.quantile(prim_gap.double(), 0.5)),
+           "prim_gap_p99": float(torch.quantile(prim_gap.double(), 0.99)),
+           "prim_gap_max": float(prim_gap.max())}
     json.dump(res, open(f"{OUT}/{a.arm}_{a.scene}.json", "w"), indent=1)
     print(f"  beta: max={res['beta_max']:.3f} p999={res['beta_p999']:.3f} "
           f"p99={res['beta_p99']:.3f} p90={res['beta_p90']:.4f} median={res['beta_p50']:.4f}",

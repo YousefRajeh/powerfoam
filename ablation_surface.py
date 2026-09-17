@@ -49,6 +49,14 @@ TAU = 0.02          # 2 cm boundary criterion
 # The crossover was measured, not guessed, and sits well inside the gap between those two.
 PARALLEL_MIN_POINTS = 150_000
 
+# Distance charged to a class the method never predicted. A missed class cannot be scored, and
+# dropping it from the per-class mean would make silence cheaper than a wrong answer. 1 m is far
+# outside any plausible correct distance (tau = 2 cm; the strongest methods sit near 0.43 m SCD)
+# yet small enough that one omitted class does not dominate a ~14-class average, unlike the
+# scene diagonal (7-10 m) used previously.
+MISSED_CAP = 1.0
+
+
 
 class GTSurfaceIndex:
     """Per-class GT points and KD-trees for one (scene, class-set). Build once, reuse."""
@@ -72,7 +80,8 @@ class GTSurfaceIndex:
         return sorted(self.n_gt)
 
 
-def semantic_surface_metrics(index: GTSurfaceIndex, pred, tau=TAU, workers=None):
+def semantic_surface_metrics(index: GTSurfaceIndex, pred, tau=TAU, workers=None,
+                             missed_penalty=True, missed_cap=None):
     """Same definitions as eval_semantic_surface.semantic_surface_metrics, reusing GT trees.
 
     `pred` is 1-based class ids with 0 = no prediction, matching calculate_metrics.
@@ -105,14 +114,24 @@ def semantic_surface_metrics(index: GTSurfaceIndex, pred, tau=TAU, workers=None)
             "boundary_precision": prec, "boundary_recall": rec,
             "boundary_f1": float(2 * prec * rec / max(prec + rec, 1e-9)),
         }
-    live = [m for m in per_class.values() if not m["missed"]]
     n_missed = sum(1 for m in per_class.values() if m["missed"])
+    keys = ("mae_pred2gt", "mae_gt2pred", "scd", "median_pred2gt", "hd95",
+            "boundary_precision", "boundary_recall", "boundary_f1")
+    if missed_penalty and n_missed:
+        # the scene diagonal: the furthest anything inside this scene can be from anything else
+        d_max = MISSED_CAP if missed_cap is None else float(missed_cap)
+        for m in per_class.values():
+            if m["missed"]:
+                m.update({k: d_max for k in keys if k.startswith(("mae", "scd", "median", "hd"))})
+                m.update({"boundary_precision": 0.0, "boundary_recall": 0.0,
+                          "boundary_f1": 0.0, "penalised": True, "d_max": d_max})
+        live = list(per_class.values())
+    else:
+        live = [m for m in per_class.values() if not m["missed"]]
     if not live:
         return {"n_classes_present": len(per_class), "n_missed": n_missed,
                 "n_scored": 0, "tau": tau, "per_class": per_class}
-    agg = {k: float(np.mean([m[k] for m in live])) for k in
-           ("mae_pred2gt", "mae_gt2pred", "scd", "median_pred2gt", "hd95",
-            "boundary_precision", "boundary_recall", "boundary_f1")}
+    agg = {k: float(np.mean([m[k] for m in live])) for k in keys}
     agg.update({"n_classes_present": len(per_class), "n_missed": n_missed,
                 "n_scored": len(live), "tau": tau, "per_class": per_class})
     return agg

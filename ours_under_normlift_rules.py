@@ -1,4 +1,25 @@
-"""NormLift's ScanNet protocol EXACTLY as their eval script implements it.
+"""OUR lift, scored under NormLift's rules. *** THIS IS NOT A NORMLIFT BASELINE. ***
+
+DO NOT REPORT THE OUTPUT OF THIS FILE AS NORMLIFT. It takes OUR solved features
+(`solved_weighted_gs_froz_ogl3.pt`, produced by accumulate_feature_stats_sam.py + our solver) and
+applies NormLift's reliability (Eq. 8, R = ||f||), their mode-vote refinement, and their evaluation
+rules. The lift is ours; only the scoring and refinement are theirs.
+
+THE REAL NORMLIFT BASELINE is a run of their repo, D:\\Downloads\\NormLift_release, whose lift
+(`lift/distill_features.py`) is built on splat-distiller's source tree and is a completely different
+accumulation from ours. It writes `outputs/<scene>/ckpts/point_cloud_features.pt`. That exists for
+the 10 ScanNet scenes and is the only thing that may be labelled NormLift.
+
+This file was previously called `normlift_protocol_exact.py`, which read as "exactly NormLift" and
+invited precisely that confusion. Renamed 2026-09-13.
+
+Corollary for ScanNet++: `stats_gs_*.pt` cannot be turned into a NormLift row. numerator/support
+reconstructs OUR weighted solve (see solve_weighted_from_stats), so Eq. 8 on top of it reproduces
+THIS file, not their lift. ScanNet++ needs their repo run for real.
+
+--- what follows is their ScanNet evaluation protocol, implemented verbatim ---
+
+NormLift's ScanNet protocol EXACTLY as their eval script implements it.
 
 Read from `D:\\Downloads\\my_eval_scannet2.py` (their evaluator), which differs from what this
 project had been doing in two ways, both of which cost us points:
@@ -49,7 +70,7 @@ def load_gs(scene, arm="gs_froz"):
     return ck["means"].float(), ck["opacities"].float().reshape(-1)
 
 
-def run(out_json="artifacts/scannet/normlift_exact.json", cull=True, identity=True):
+def run(out_json="artifacts/scannet/ours_under_normlift_rules.json", cull=True, identity=True):
     enable_determinism()
     device = "cuda"
     res = {}
