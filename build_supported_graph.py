@@ -60,6 +60,10 @@ def main():
     ap.add_argument("--min-obs", type=int, default=1, help="pixel-adjacency observations required")
     ap.add_argument("--tau", type=float, default=3.0, help="max mean depth jump, in local spacings")
     ap.add_argument("--keep-zero-area", type=int, default=0, help="1 keeps zero-area faces")
+    # ~90% of cells are interior non-owners and never reach the front surface, so 77.4% of edges are
+    # never observed at all. Dropping those conflates "unsupported" with "invisible", which isolates
+    # 25.9% of vertices. `--unobserved keep` drops an edge only when it IS seen and IS discontinuous.
+    ap.add_argument("--unobserved", default="drop", choices=["drop", "keep"])
     ap.add_argument("--report", default=None)
     a = ap.parse_args()
     dev = "cuda"
@@ -141,7 +145,8 @@ def main():
         if vi % 40 == 0:
             print("  view %d/%d" % (vi, n_views), flush=True)
 
-    mean_dz = torch.where(n_obs > 0, dsum / n_obs.clamp_min(1), torch.full_like(dsum, float("inf")))
+    unobs_fill = 0.0 if a.unobserved == "keep" else float("inf")
+    mean_dz = torch.where(n_obs > 0, dsum / n_obs.clamp_min(1), torch.full_like(dsum, unobs_fill))
 
     # local spacing: median nearest-neighbour distance between adjacent cell centres
     if "dist" in ad:
@@ -151,7 +156,9 @@ def main():
         cc = centers.cpu()
         spacing = float((cc[src] - cc[adj]).norm(dim=-1).median())
 
-    keep_u = (n_obs >= a.min_obs) & (mean_dz <= a.tau * spacing)
+    keep_u = (mean_dz <= a.tau * spacing)
+    if a.unobserved == "drop":
+        keep_u &= n_obs >= max(a.min_obs, 1)
     if a.areas and not a.keep_zero_area:
         ar = torch.load(a.areas, map_location="cpu", weights_only=False)["area"].to(dev)
         if ar.numel() != E:
