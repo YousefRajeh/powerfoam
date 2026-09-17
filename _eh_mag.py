@@ -4,8 +4,8 @@ from determinism import enable_determinism; enable_determinism(verbose=False)
 import measure_xball2 as XB
 dev='cuda'
 print(f"{'scene':14s} {'E_H':>12s} {'graph':>12s} {'extra':>12s} {'extra/E_H':>10s} {'c':>12s} {'mean r':>9s}", flush=True)
-for sc in ('scene0000_00','scene0070_00','scene0400_00'):
-    row,col,val,gid,Treg,P,R,_ = XB.build(sc,'pf_truefrozen',12,512,dev)
+for sc in ('scene0000_00',):
+    row,col,val,gid,Treg,P,R,_ = XB.build(sc,'pf_truefrozen',6,512,dev)
     o=torch.argsort(row); row,col,val=row[o].contiguous(),col[o].contiguous(),val[o].contiguous()
     nnz=val.numel(); d=Treg.shape[1]
     D=torch.zeros(P,device=dev).index_add_(0,col,val)
