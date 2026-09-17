@@ -152,6 +152,13 @@ def main():
     ap.add_argument("--views", type=int, default=12)
     ap.add_argument("--cap", type=int, default=512)
     ap.add_argument("--cat-on-cpu", action="store_true")
+    ap.add_argument("--tau-sweep", action="store_true",
+                    help="sweep an exposure threshold tau and report gamma(tau) against the SCORED-"
+                         "POINT mass retained. Restricting to S makes the Gershgorin row sum "
+                         "s_j^S = sum_{k in S, k != j} G_jk/d_j <= s_j, so reusing the full s_j is "
+                         "CONSERVATIVE and the bound on the principal submatrix C_SS is valid. The "
+                         "resulting claim is about the sub-operator on well-exposed primitives, so "
+                         "the retained evaluation mass must be quoted with it.")
     ap.add_argument("--out", default="artifacts/scannet/conditioning.json")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
@@ -198,13 +205,62 @@ def main():
             Atr = scatter(P, col, val * r[row])
 
             live = d > 0
+            hit = torch.zeros(R, dtype=torch.bool, device=dev); hit[row] = True
+            rmax = float(r[hit].max())
             q = torch.zeros(P, device=dev); s_ = torch.zeros(P, device=dev)
             q[live] = Gjj[live] / d[live]
             s_[live] = (Atr[live] - Gjj[live]) / d[live]
             gap = (q - s_)[live]
             gamma = float(gap.min())
-            hit = torch.zeros(R, dtype=torch.bool, device=dev); hit[row] = True
-            rmax = float(r[hit].max())
+
+
+            # ---- tau sweep: gamma on the well-exposed sub-operator, against evaluation mass kept
+            sweep = None
+            if a.tau_sweep:
+                import glob as _g, os as _o
+                from diagnose_holes import GT_ROOT, geometry
+                from diagnose_scannet_miou import load_scannet_pointcept_gt
+                from evaluate_point_cloud_miou import OPENGAUSSIAN_CLASS_SETS, remap_gt_labels
+                from point_cloud_query import (assign_points_to_power_cells,
+                                               assign_points_to_nearest_center)
+                dd = [x for x in _g.glob(_o.path.join(GT_ROOT, "*", sc)) if _o.path.isdir(x)][0]
+                pts, raw, names = load_scannet_pointcept_gt(dd, "segment20")
+                n2i = {n: i for i, n in enumerate(names)}
+                pr_ = set(np.unique(raw).tolist())
+                kept_ = [n for n in OPENGAUSSIAN_CLASS_SETS["opengaussian19"] if n2i[n] in pr_]
+                gl = remap_gt_labels(raw, [n2i[n] for n in kept_]).astype(np.int64)
+                vis = np.load(_o.path.join("artifacts", "scannet", sc, "gt_visible.npy"))
+                mm = (gl > 0) & vis
+                rec_ = arm.replace("pf_", "")
+                if rec_ in XB.FOAM:
+                    cen, rad, _u = geometry(sc, rec_)
+                    own = assign_points_to_power_cells(pts[mm], cen, rad, valid=None, k=64)
+                else:
+                    ck = torch.load(f"recon_remote/{arm}/{sc}/ckpt.pt", map_location="cpu",
+                                    weights_only=False)
+                    spp = ck["splats"] if "splats" in ck else ck
+                    own = assign_points_to_nearest_center(pts[mm], spp["means"].float().numpy(),
+                                                          valid=None)
+                ok_ = own >= 0
+                wv = torch.zeros(P, device=dev)
+                wv.index_add_(0, torch.from_numpy(own[ok_]).to(dev),
+                              torch.ones(int(ok_.sum()), device=dev))
+                tot_pts = float(wv.sum())
+                gapf = (q - s_)
+                sweep = []
+                for frac in (0.0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.05, 0.1, 0.25, 0.5):
+                    tau = frac * float(d[live].median())
+                    S = live & (d >= tau)
+                    if not bool(S.any()):
+                        continue
+                    gS = float(gapf[S].min())
+                    sweep.append({"tau_rel_median_d": frac, "tau": tau,
+                                  "n_kept": int(S.sum()),
+                                  "frac_prims_kept": float(S.sum() / max(int(live.sum()), 1)),
+                                  "frac_raymass_kept": float(d[S].sum() / d[live].sum()),
+                                  "frac_points_kept": float(wv[S].sum() / max(tot_pts, 1e-30)),
+                                  "gamma": gS,
+                                  "kappa_bound": (rmax / gS) if gS > 0 else None})
 
             ql = q[live]
             pct = [float(torch.quantile(gap.float(), t)) for t in (0.01, 0.05, 0.25, 0.5)]
@@ -219,6 +275,7 @@ def main():
                    "gap_p01": pct[0], "gap_p05": pct[1], "gap_p25": pct[2], "gap_p50": pct[3],
                    "d_p01": float(torch.quantile(d[live].float(), 0.01)),
                    "d_median": float(d[live].median()),
+                   "tau_sweep": sweep,
                    "wall_s": round(time.time() - t0, 1)}
             out.append(rec); json.dump(out, open(a.out, "w"), indent=1)
             print(f"[{arm}/{sc}] live {rec['n_live']:,} dead {rec['n_dead']:,} | q med "
